@@ -1,0 +1,10 @@
+[package]
+name = "faxserver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+t38 = { path = "../t38" }
+store = { path = "../store" }

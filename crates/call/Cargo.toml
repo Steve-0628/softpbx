@@ -1,0 +1,12 @@
+[package]
+name = "call"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sip-stack = { path = "../sip-stack" }
+media = { path = "../media" }
+vbd = { path = "../vbd" }
+store = { path = "../store" }

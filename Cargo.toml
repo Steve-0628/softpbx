@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sip-syntax",
+    "crates/sip-stack",
+    "crates/rtp",
+    "crates/media",
+    "crates/vbd",
+    "crates/t38",
+    "crates/faxserver",
+    "crates/line-gw",
+    "crates/call",
+    "crates/store",
+    "crates/api",
+    "crates/engine-sim",
+    "apps/pbx-daemon",
+    "apps/pbx-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.98"
+publish = false
+
+# 実装時に使う外部クレートの予定バージョン。
+# いまの雛形は外部依存を持たない（cargo check が常に通ることを保証するため）。
+# クレートが実際に使い始めるまではこの一覧は解決されない。
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "sync",
+    "time",
+    "macros",
+    "signal",
+    "fs",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+winnow = "0.6"          # SIP/SDP の構文解析（sip-syntax）
+axum = "0.8"            # API サーバ（api）
+tokio-rustls = "0.26"   # SIP over TLS / HTTPS
+rustls = "0.23"
+socket2 = "0.6"         # メディア用ソケット（rtp/media）
+libc = "0.2"            # SCHED_FIFO、recvmmsg 等（media）
+lettre = "0.11"         # FAX のメール送信（faxserver）
+proptest = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

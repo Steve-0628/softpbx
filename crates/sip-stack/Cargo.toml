@@ -1,0 +1,9 @@
+[package]
+name = "sip-stack"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sip-syntax = { path = "../sip-syntax" }

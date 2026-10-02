@@ -1,0 +1,30 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# 生成物・一時ファイル
+/build/
+/dist/
+/work/
+*.log
+*.tmp
+
+# UI
+/ui/node_modules/
+/ui/dist/
+/ui/.vite/
+
+# デバッグ
+core
+core.*
+*.core
+
+# エディタ
+.idea/
+.vscode/
+*.swp
+
+# 保存データ（開発時のローカル実行）
+/var/
+/data/

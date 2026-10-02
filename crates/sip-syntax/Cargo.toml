@@ -1,0 +1,9 @@
+[package]
+name = "sip-syntax"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# 依存を持たない純粋層。I/O も行わない（docs/02 §7）

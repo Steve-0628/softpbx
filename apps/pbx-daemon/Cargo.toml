@@ -1,0 +1,13 @@
+[package]
+name = "pbx-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+call = { path = "../../crates/call" }
+sip-stack = { path = "../../crates/sip-stack" }
+media = { path = "../../crates/media" }
+store = { path = "../../crates/store" }
+api = { path = "../../crates/api" }
