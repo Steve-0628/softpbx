@@ -70,9 +70,9 @@ Adversarial probes (the "evil peer" set), all locked as golden tests in
 
 | Probe | Behavior |
 | --- | --- |
-| `Require: 100rel, timer` | `400`? no — `420 Bad Extension` + `Unsupported` (docs/07 rule: never half an extension) |
+| `Require: 100rel, timer` | `420 Bad Extension` + `Unsupported` (docs/07 rule: never half an extension) — but *ignored* in ACK/CANCEL, and never allowed to block a BYE |
 | `UPDATE` / `PRACK` / `REFER` | `405` + `Allow` |
-| `Session-Expires: 1800;refresher=uas` | answered `200` with `Session-Expires: 1800;refresher=uac` — the peer times and refreshes; our re-INVITE handling absorbs it |
+| `Session-Expires: 1800;refresher=uas` | answered `200` **without** `Session-Expires`: we never claim session timers (claiming a refresher over the UAC's choice violates RFC 4028 §9 Table 2) |
 | INVITE without Contact | `400` (RFC 3261 §8.1.1.8 — no Contact means an unhangupable call) |
 | Simultaneous re-INVITE ("glare") | each leg answered independently with the session unchanged — by design, and covered per leg |
 

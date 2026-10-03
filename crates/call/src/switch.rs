@@ -279,16 +279,25 @@ impl Switch {
     }
 
     fn handle_request(&mut self, request: Request, now_ms: u64) -> Vec<Output> {
-        // RFC 3261 §8.2.2.3: never half-implement an extension. Anything the
+        // RFC 3261 §8.2.2.3: never half-implement an extension — anything the
         // request *requires* that we do not implement gets 420 + Unsupported.
-        let unsupported = unsupported_require(&request);
+        // The same section says Require MUST be *ignored* in ACK and CANCEL;
+        // we extend that to BYE on purpose — teardown must never be blocked by
+        // an extension we do not implement (docs/07 §2).
+        let check_require = !matches!(request.method, Method::Ack | Method::Cancel | Method::Bye);
+        let unsupported = if check_require {
+            unsupported_require(&request)
+        } else {
+            Vec::new()
+        };
         if !unsupported.is_empty() {
-            let mut response = make_response(&request, 420, "Bad Extension");
-            response.headers.push(Header {
-                name: "Unsupported".to_string(),
-                value: unsupported.join(", "),
-            });
-            return vec![Output::Send(Message::Response(response))];
+            return self.refuse(
+                &request,
+                420,
+                "Bad Extension",
+                Some(("Unsupported", &unsupported.join(", "))),
+                now_ms,
+            );
         }
         match request.method {
             Method::Register => {
@@ -312,15 +321,39 @@ impl Switch {
             Method::Ack => self.handle_ack(request, now_ms),
             Method::Bye => self.handle_bye(request, now_ms),
             Method::Cancel => self.handle_cancel(request, now_ms),
-            Method::Other(_) => {
-                let mut response = make_response(&request, 405, "Method Not Allowed");
-                response.headers.push(Header {
-                    name: "Allow".to_string(),
-                    value: ALLOW.to_string(),
-                });
-                vec![Output::Send(Message::Response(response))]
-            }
+            Method::Other(_) => self.refuse(
+                &request,
+                405,
+                "Method Not Allowed",
+                Some(("Allow", ALLOW)),
+                now_ms,
+            ),
         }
+    }
+
+    /// Refuses a request with a status through a real server transaction:
+    /// retransmission-safe, and properly tagged (RFC 3261 §8.2.6.2).
+    fn refuse(
+        &mut self,
+        request: &Request,
+        status: u16,
+        reason: &str,
+        extra: Option<(&str, &str)>,
+        now_ms: u64,
+    ) -> Vec<Output> {
+        let mut outputs = Vec::new();
+        let (mut tx, actions) = ServerTransaction::new(request.clone(), now_ms);
+        push_sends(&mut outputs, actions);
+        let mut response = tagged(make_response(request, status, reason), &self.fresh_tag());
+        if let Some((name, value)) = extra {
+            response.headers.push(Header {
+                name: name.to_string(),
+                value: value.to_string(),
+            });
+        }
+        let actions = tx.on_response_from_user(response, now_ms);
+        push_sends(&mut outputs, actions);
+        outputs
     }
 
     // ----- call setup ------------------------------------------------------
@@ -1028,15 +1061,9 @@ impl Switch {
                     name: "Contact".to_string(),
                     value: contact,
                 });
-                // Session timers (RFC 4028): we never refresh, so hand the
-                // refresher role to the peer (§7.2 lets the UAS choose). The
-                // peer then refreshes with re-INVITE, which we absorb.
-                if let Some(seconds) = session_expires_of(&call.caller_invite) {
-                    response.headers.push(Header {
-                        name: "Session-Expires".to_string(),
-                        value: format!("{seconds};refresher=uac"),
-                    });
-                }
+                // No session timers (docs/07 §3): we never claim the
+                // extension, so the answer carries no Session-Expires and the
+                // peer runs the session as it sees fit.
                 if let Some(media) = &call.media {
                     let offered = sdp_payload_types(&call.caller_invite.body);
                     response.headers.push(Header {
@@ -1294,29 +1321,19 @@ fn parse_timer_name(name: &str) -> Option<(u64, TxSlot, Timer)> {
 
 /// Option tags a request requires that we do not implement (RFC 3261 §8.2.2.3).
 /// We implement none, so every tag in `Require` is unsupported — and that is
-/// the honest answer (docs/07 §2).
+/// the honest answer (docs/07 §2). Duplicates are listed once.
 fn unsupported_require(request: &Request) -> Vec<String> {
-    request
+    let mut tags: Vec<String> = request
         .headers
         .iter()
         .filter(|header| canonical_header(&header.name) == "require")
         .flat_map(|header| header.value.split(','))
         .map(|tag| tag.trim().to_string())
         .filter(|tag| !tag.is_empty())
-        .collect()
-}
-
-/// The session interval an INVITE proposes (RFC 4028 `Session-Expires`).
-fn session_expires_of(request: &Request) -> Option<u64> {
-    let value = header(&request.headers, "session-expires")?;
-    value
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .parse()
-        .ok()
-        .filter(|seconds: &u64| *seconds > 0)
+        .collect();
+    tags.sort();
+    tags.dedup();
+    tags
 }
 
 /// Payload type numbers an SDP body offers, for codec intersection.
@@ -1436,7 +1453,6 @@ fn reason_phrase(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         408 => "Request Timeout",
         420 => "Bad Extension",
-        421 => "Extension Required",
         481 => "Call/Transaction Does Not Exist",
         486 => "Busy Here",
         487 => "Request Terminated",

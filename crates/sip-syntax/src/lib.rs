@@ -177,6 +177,7 @@ pub fn canonical_header(name: &str) -> String {
         "e" => "Content-Encoding",
         "s" => "Subject",
         "t" => "To",
+        "x" => "Session-Expires",
         _ => name,
     };
     expanded.to_ascii_lowercase()

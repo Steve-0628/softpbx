@@ -75,6 +75,7 @@ pub struct General {
 
 /// One `[[device]]`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceCfg {
     /// Its number ("1001").
     pub number: String,
@@ -134,6 +135,9 @@ impl FileConfig {
             if rule.pattern.is_empty() {
                 bail!("a [[routing]] rule has an empty match");
             }
+            if rule.pattern.len() > 64 {
+                bail!("routing match \"{}\" is too long (max 64)", rule.pattern);
+            }
             let known = rule.to == "dialed"
                 || rule.to == "reject"
                 || (!rule.to.is_empty() && rule.to.bytes().all(|b| b.is_ascii_digit()));
@@ -143,6 +147,20 @@ impl FileConfig {
                     rule.pattern,
                     rule.to
                 );
+            }
+            if let Some(strip) = &rule.strip {
+                if rule.to != "dialed" {
+                    bail!(
+                        "routing match \"{}\": strip only makes sense with to = \"dialed\"",
+                        rule.pattern
+                    );
+                }
+                if strip.is_empty() {
+                    bail!(
+                        "routing match \"{}\": strip must not be empty",
+                        rule.pattern
+                    );
+                }
             }
         }
         let mut numbers = HashSet::new();
@@ -164,7 +182,16 @@ impl FileConfig {
     pub fn switch_config(&self) -> SwitchConfig {
         SwitchConfig {
             realm: self.general.realm.clone(),
-            pbx_uri: format!("sip:{}", self.general.pbx_host),
+            // The address-of-record domain is the host, without the SIP port
+            // (RFC 3261 §19.1.5).
+            pbx_uri: format!(
+                "sip:{}",
+                self.general
+                    .pbx_host
+                    .parse::<std::net::SocketAddr>()
+                    .map(|address| address.ip().to_string())
+                    .unwrap_or_else(|_| self.general.pbx_host.clone())
+            ),
             pbx_host: self.general.pbx_host.clone(),
             pbx_contact: format!("<sip:{}>", self.general.pbx_host),
             rtp_host: self.general.rtp_host.clone(),
@@ -274,5 +301,18 @@ mod tests {
 
         let empty_match = format!("{GOOD}\n[[routing]]\nmatch = \"\"\nto = \"dialed\"\n");
         assert!(FileConfig::parse(&empty_match).is_err());
+
+        // strip is meaningless unless the rule routes to the dialed number.
+        let bad_strip =
+            format!("{GOOD}\n[[routing]]\nmatch = \"9*\"\nto = \"reject\"\nstrip = \"9\"\n");
+        assert!(FileConfig::parse(&bad_strip).is_err());
+    }
+
+    #[test]
+    fn device_unknown_keys_are_refused() {
+        // The same promise as everywhere else: a typo is an error, not silence.
+        let typo = GOOD.replace("name = \"Alice\"", "name = \"Alice\"\npin = \"1234\"");
+        let error = FileConfig::parse(&typo).expect_err("unknown device key");
+        assert!(format!("{error:#}").contains("pin"), "{error:#}");
     }
 }

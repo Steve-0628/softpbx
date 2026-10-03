@@ -1304,6 +1304,94 @@ fn golden_invite_without_contact_is_400() {
     assert_eq!(switch.active_calls(), 0);
 }
 
+/// RFC 3261 §8.2.2.3: `Require` MUST be ignored in ACK and CANCEL. We extend
+/// that to BYE on purpose — a teardown must never be blocked by an extension
+/// we do not implement (docs/07 §2).
+#[test]
+fn golden_require_is_ignored_for_ack_cancel_bye() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+
+    // ACK carries Require all the time (peers copy it there) — and an ACK
+    // takes no response at all.
+    let ack = "ACK sip:1002@192.0.2.10 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-golden-ack-req\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:1001@192.0.2.10>;tag=from1\r\n\
+         To: <sip:1002@192.0.2.10>;tag=pbx1\r\n\
+         Call-ID: golden-ack-req\r\n\
+         CSeq: 1 ACK\r\n\
+         Require: 100rel\r\n\
+         Content-Length: 0\r\n\r\n";
+    let outputs = feed(&mut world, &mut switch, ack.as_bytes());
+    assert!(outputs.is_empty(), "an ACK gets no response: {outputs:?}");
+
+    // CANCEL with Require: the CANCEL is honored (200), the INVITE dies (487).
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite_bytes("1001", "1002", "golden-cancel-req", "192.0.2.1:10000"),
+    );
+    let callee_invite = request_of(&outputs, Method::Invite);
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(&callee_invite, 180, "Ringing", "bob1", b""),
+    );
+    let ringing = response_of(&outputs, 180);
+    let cancel = format!(
+        "CANCEL sip:1002@192.0.2.10 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-golden-cancel-req\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:1001@192.0.2.10>;tag=from1\r\n\
+         To: {};tag={}\r\n\
+         Call-ID: golden-cancel-req\r\n\
+         CSeq: 1 CANCEL\r\n\
+         Require: 100rel\r\n\
+         Content-Length: 0\r\n\r\n",
+        "sip:1002@192.0.2.10",
+        tag_of(header_value(&ringing.headers, "to").unwrap()).unwrap()
+    );
+    let outputs = feed(&mut world, &mut switch, cancel.as_bytes());
+    assert_eq!(
+        response_of(&outputs, 200).status,
+        200,
+        "the CANCEL is honored: {outputs:?}"
+    );
+    assert_eq!(response_of(&outputs, 487).status, 487);
+
+    // BYE with Require: the call still goes down.
+    let call = establish_call(
+        &mut world,
+        &mut switch,
+        "golden-bye-req",
+        "1001",
+        "1002",
+        "192.0.2.1:10002",
+        "192.0.2.2:20002",
+    );
+    let bye = format!(
+        "BYE sip:192.0.2.10:5060 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-golden-bye-req\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:1001@192.0.2.10>;tag=from1\r\n\
+         To: <sip:1002@192.0.2.10>;tag={}\r\n\
+         Call-ID: {}\r\n\
+         CSeq: 2 BYE\r\n\
+         Require: 100rel\r\n\
+         Content-Length: 0\r\n\r\n",
+        call.to_tag, call.call_id
+    );
+    let outputs = feed(&mut world, &mut switch, bye.as_bytes());
+    assert_eq!(
+        response_of(&outputs, 200).status,
+        200,
+        "the BYE is honored: {outputs:?}"
+    );
+    assert_eq!(switch.active_calls(), 0, "and the call is down");
+}
+
 // ----- helpers for the regressions ------------------------------------------
 
 fn phones() -> Vec<Device> {
@@ -1796,7 +1884,7 @@ fn ac_call_routing() {
     );
     let callee_invite = request_of(&outputs, Method::Invite);
     let to = header_value(&callee_invite.headers, "to").unwrap();
-    assert!(to.contains("1002"), "0 routes to 1002: {to}");
+    assert!(to.contains("sip:1002@"), "0 routes to 1002: {to}");
 
     // "91002": the 9 gets stripped, so the device 1002 rings.
     let outputs = feed(
@@ -1806,7 +1894,7 @@ fn ac_call_routing() {
     );
     let callee_invite = request_of(&outputs, Method::Invite);
     let to = header_value(&callee_invite.headers, "to").unwrap();
-    assert!(to.contains("1002"), "9-prefix stripped: {to}");
+    assert!(to.contains("sip:1002@"), "9-prefix stripped: {to}");
 
     // "1999" is refused outright and logged.
     let outputs = feed(
@@ -1817,14 +1905,19 @@ fn ac_call_routing() {
     assert_eq!(response_of(&outputs, 403).status, 403, "{outputs:?}");
     let logs = call_logs(&outputs);
     assert!(logs[0].contains("\"result\":\"restricted\""), "{}", logs[0]);
+    // A refusal before routing logs what was dialed (docs/02 §5).
+    assert!(logs[0].contains("\"callee\":\"1999\""), "{}", logs[0]);
 
-    // An unmatched number falls through to the plain lookup (404 here).
+    // An unmatched number falls through to the plain lookup (404 here) —
+    // and the log records the *routed* number once routing ran (docs/02 §5).
     let outputs = feed(
         &mut world,
         &mut switch,
-        &invite_bytes("1001", "7777", "route-none", "192.0.2.1:10006"),
+        &invite_bytes("1001", "91003", "route-none", "192.0.2.1:10006"),
     );
     assert_eq!(response_of(&outputs, 404).status, 404);
+    let logs = call_logs(&outputs);
+    assert!(logs[0].contains("\"callee\":\"1003\""), "{}", logs[0]);
 }
 
 // ----- golden rejection tests (docs/07 §4 rule 2) ---------------------------
@@ -1879,10 +1972,10 @@ fn golden_update_and_prack_get_405() {
     }
 }
 
-/// Session timers: we never refresh, so the peer gets the refresher role
-/// (RFC 4028 §7.2) — its refreshes land on our re-INVITE handling.
+/// Session timers: we never claim the extension (docs/07 §3). The peer
+/// may propose all it likes; the answer carries no Session-Expires.
 #[test]
-fn golden_session_timer_makes_the_peer_the_refresher() {
+fn golden_session_timers_are_not_claimed() {
     let mut world = World::with_seed(0x5EED);
     let mut switch = switch();
     register_both(&mut world, &mut switch);
@@ -1922,10 +2015,14 @@ fn golden_session_timer_makes_the_peer_the_refresher() {
         ),
     );
     let answered = response_of(&outputs, 200);
-    let session = header_value(&answered.headers, "Session-Expires").expect("Session-Expires");
-    assert!(
-        session.contains("refresher=uac"),
-        "the peer must time the session: {session}"
+    // We do not implement session timers (RFC 4028): the answer must not
+    // claim the extension at all. (Claiming it wrongly — say by echoing
+    // `refresher=uac` over the UAC's `refresher=uas` — is a MUST-level
+    // violation of §9 Table 2 and breaks the "never half an extension"
+    // rule of docs/07.)
+    assert_eq!(
+        header_value(&answered.headers, "Session-Expires"),
+        None,
+        "we never claim session timers"
     );
-    assert!(session.starts_with("1800"), "interval preserved: {session}");
 }

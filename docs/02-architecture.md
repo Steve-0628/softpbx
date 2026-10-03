@@ -101,7 +101,9 @@ Ring groups and trunk targets get their own sections here later.
 - Human-readable structured logs to stdout (journald in production).
 - One append-only NDJSON call log: one line per call with the caller, the
   callee, start/end offsets in milliseconds since the daemon started, and the
-  outcome. This is what answers "why did that call fail?" later on. Lines are
+  outcome. `callee` is the *routed* number once routing ran, and what was
+  dialed for refusals that happen before it (unauthorized, restricted). This
+  is what answers "why did that call fail?" later on. Lines are
   appended and never rewritten, and nothing ever reads the file back — it is
   for humans (and `jq`).
 

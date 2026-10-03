@@ -61,18 +61,34 @@ pub fn route(rules: &[Rule], dialed: &str) -> Destination {
     Destination::Ring(dialed.to_string())
 }
 
-/// Glob matching: `*` = any run (including empty), `?` = one character.
+/// Glob matching: `*` = any run (including empty), `?` = one byte. Linear
+/// backtracking (one star at a time) — no exponential blowup on hostile
+/// patterns or long dialed strings.
 pub fn glob_match(pattern: &str, value: &str) -> bool {
-    fn go(p: &[u8], v: &[u8]) -> bool {
-        match (p.split_first(), v.split_first()) {
-            (None, None) => true,
-            (Some((&b'*', rest)), _) => (0..=v.len()).any(|skip| go(rest, &v[skip..])),
-            (Some((&b'?', rest)), Some((_, vrest))) => go(rest, vrest),
-            (Some((&c, prest)), Some((_, vrest))) if c == *v.first().unwrap() => go(prest, vrest),
-            _ => false,
+    let (mut p, mut v) = (pattern.as_bytes(), value.as_bytes());
+    let (mut star, mut retry) = (None, 0);
+    while !v.is_empty() {
+        match p.first() {
+            Some(&b'*') => {
+                star = Some(p);
+                p = &p[1..];
+                retry = 0;
+            }
+            Some(&b'?') | Some(_) if !p.is_empty() && (p[0] == b'?' || p[0] == v[0]) => {
+                p = &p[1..];
+                v = &v[1..];
+            }
+            _ => match star {
+                Some(star_pattern) => {
+                    retry += 1;
+                    p = &star_pattern[1..];
+                    v = &value.as_bytes()[retry..];
+                }
+                None => return false,
+            },
         }
     }
-    go(pattern.as_bytes(), value.as_bytes())
+    p.iter().all(|&c| c == b'*')
 }
 
 #[cfg(test)]

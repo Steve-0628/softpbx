@@ -85,10 +85,9 @@ soak runs pass; findings are in docs/09.
 
 ## Phase 8 — Call routing (roadmap step 3)
 
-- `[[routing]]` config sections: match (what was dialed) → target, with number
-  rewriting and rejection; normalization rules (`+81…`, leading digits)
-- Refuse calls to nowhere with a clear code (`404` today becomes "no rule
-  matched")
+- `[[routing]]` config sections: match (what was dialed) → target, with
+  prefix-stripping rewriting and rejection
+- Refuse restricted numbers clearly (`403` + `restricted` in the call log)
 
 **Done when:** routing works on real phones and every rule has a simulation
 test; the config validator rejects nonsense rules at startup.

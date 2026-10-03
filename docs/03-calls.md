@@ -18,9 +18,8 @@ A wrong password gets rejected. An unknown number gets rejected.
 Alice (1001) picks up her phone and dials 1002.
 
 1. Her phone sends an **INVITE** to the PBX saying "connect me to 1002".
-2. The PBX decides where the call goes: today that means "is 1002 a number on
-   this system?" (call routing rules — pattern matching, rewriting — are
-   roadmap step 3, docs/05).
+2. The PBX decides where the call goes, through call routing rules (§4) —
+   and where it does not, the call fails with `404`.
 3. The PBX sends an INVITE to Bob's phone. Bob's phone starts **ringing**.
 4. Bob picks up. His phone says "OK".
 5. The PBX tells Alice's phone "OK" too, and from now on it forwards audio
