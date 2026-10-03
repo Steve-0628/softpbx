@@ -7,3 +7,6 @@ publish.workspace = true
 
 [dependencies]
 sip-syntax = { path = "../sip-syntax" }
+
+[dev-dependencies]
+proptest = { workspace = true }

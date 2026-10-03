@@ -6,7 +6,6 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-call = { path = "../call" }
+# The test bed drives whatever is under test; grown per phase.
+sip-syntax = { path = "../sip-syntax" }
 sip-stack = { path = "../sip-stack" }
-rtp = { path = "../rtp" }
-media = { path = "../media" }
