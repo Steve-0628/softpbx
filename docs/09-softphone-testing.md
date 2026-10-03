@@ -110,3 +110,21 @@ The facts that shape the trunk work:
 First interop already happened: MikoPBX registered to a test `pbx-daemon`,
 re-registers every ~60 s, and its INVITEs are answered correctly (`404` for an
 unmapped number, ACKed and torn down cleanly).
+
+## 7. Interop matrix (living document)
+
+| Behavior | MikoPBX ↔ softpbx | Notes |
+| --- | --- | --- |
+| MikoPBX registers to softpbx (trunk as 1001) | ✅ | re-registers every ~60 s; qop-less digest accepted |
+| **Full site-to-site call** (3001 → `71002` → route strips 7 → trunk → 1002) | ✅ | INVITE→180→200→ACK, `StreamsRunning` on the far side |
+| RTP relayed both directions | ✅ | real bridge traffic through softpbx's relay ports, byte-transparent |
+| Far-side hang-up (BYE from MikoPBX) | ✅ | our phone tore down; one `completed` call-log line |
+| Caller identity | ⚠️ | arrives as the trunk login (1001) — the documented `username` identity quirk; configure their trunk accordingly when the real caller matters |
+| Session refresh / UPDATE / PRACK | — | MikoPBX never sends any (captured, 78 s call) |
+| OPTIONS qualify probes | ✅ | answered; keep it that way |
+
+## 8. Soak results
+
+The phase-7 soak completed: **3000/3000 calls** (300 loops × 10 concurrent,
+real-socket fake phones, reused identities) — every loop 10/10, every call
+logged `completed`, no stuck calls, no leaked media ports, zero parser noise.
