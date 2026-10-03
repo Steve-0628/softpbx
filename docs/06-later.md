@@ -17,7 +17,7 @@ timers. Those go in per-device data tables (docs/03 §7), each with a test.
 
 Analog phones, fax machines, and similar devices connect to an **external
 analog gateway** (e.g. Yamaha NVR500/510-class), which converts them to SIP.
-softpbx just sees more SIP endpoints.
+softpbx just sees more SIP devices.
 
 We do not provision or manage the gateway. A human configures it once through
 its own web interface, using a checklist we document here:
@@ -65,7 +65,7 @@ What this needs from us when the day comes:
 - Gateway settings per [§2](#2-analog-devices-via-an-external-gateway):
   echo canceller and jitter adaptation off on that port.
 - Nothing else in softpbx changes: a modem call looks like a call between two
-  SIP endpoints.
+  SIP devices.
 
 Honest expectation: this works well on a quiet LAN and degrades badly on a
 lossy link — modems are far less forgiving than voice or fax. If a use case

@@ -1,9 +1,9 @@
 //! Audio handling: G.711 and the SDP we put on the wire (docs/02 §2).
 //!
-//! Deliberately small. We do not transcode (docs/03 §1: same codec on both
-//! legs wherever possible) and we put no DSP on the forwarded stream
-//! (docs/02 §8) — so this crate is codec *identity* and SDP, not signal
-//! processing. Mixing and transcoding come later, if ever.
+//! Deliberately small. We do not transcode (same codec on both legs wherever
+//! possible) and we put no DSP on the forwarded stream (docs/02 §8) — so this
+//! crate is codec *identity* and SDP, not signal processing. Mixing and
+//! transcoding come later, if ever.
 
 /// Codecs we speak (docs/07 SDP subset).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,19 +57,26 @@ pub fn audio_sdp(connection_ip: &str, port: u16) -> Vec<u8> {
 
 /// Builds an SDP answer limited to the codecs the offer actually contained
 /// (RFC 3264 §6: answer with the intersection, never a codec they did not
-/// offer). Falls back to our full list if the offer shares none of ours.
+/// offer). If the offer shares none of ours, the stream is **declined**
+/// (`m=audio 0`) instead of answered with something they never offered.
 pub fn audio_sdp_answer(connection_ip: &str, port: u16, offered_payload_types: &[u8]) -> Vec<u8> {
     let shared: Vec<Codec> = OUR_CODECS
         .iter()
         .copied()
         .filter(|codec| offered_payload_types.contains(&codec.payload_type()))
         .collect();
-    let codecs: &[Codec] = if shared.is_empty() {
-        &OUR_CODECS
-    } else {
-        &shared
-    };
-    build_sdp(connection_ip, port, codecs)
+    if shared.is_empty() {
+        return format!(
+            "v=0\r\n\
+             o=softpbx 1 1 IN IP4 {connection_ip}\r\n\
+             s=-\r\n\
+             c=IN IP4 {connection_ip}\r\n\
+             t=0 0\r\n\
+             m=audio 0 RTP/AVP 0\r\n\r\n"
+        )
+        .into_bytes();
+    }
+    build_sdp(connection_ip, port, &shared)
 }
 
 fn build_sdp(connection_ip: &str, port: u16, codecs: &[Codec]) -> Vec<u8> {

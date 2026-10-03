@@ -1,8 +1,8 @@
 //! Digest authentication (RFC 2617, MD5) — the only authentication in v1.
 //!
 //! Tolerant parsing of `Authorization` headers, strict verification of the
-//! response hash. Nonce freshness is deliberately not tracked: the response
-//! hash covers the nonce, and the network is trusted (docs/01 §4).
+//! response hash. Nonce freshness is enforced by the caller (the registrar
+//! only accepts nonces it issued, within a short window).
 
 use md5::{Digest, Md5};
 
@@ -85,6 +85,12 @@ pub fn parse_authorization(value: &str) -> Option<Credentials> {
             .find(|(key, _)| key == name)
             .map(|(_, field_value)| field_value.clone())
     };
+    // We implement qop=auth only; auth-int (body hashing) is not supported and
+    // must not be silently accepted.
+    match get("qop").as_deref() {
+        None | Some("auth") => {}
+        Some(_) => return None,
+    }
     Some(Credentials {
         username: get("username")?,
         realm: get("realm")?,

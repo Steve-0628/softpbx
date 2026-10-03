@@ -1,4 +1,4 @@
-//! The PBX core: routes calls between registered devices (docs/02 §4).
+//! The PBX core: routes calls between registered devices (docs/02 §2, docs/03).
 //!
 //! A [`Switch`] is a pure message processor: SIP messages in (already parsed),
 //! SIP messages out plus call-log lines. No sockets, no clock of its own —
@@ -17,8 +17,8 @@
 use std::collections::{BTreeSet, HashMap};
 
 use sip_stack::{
-    ack_for_2xx, make_response, tag_of, uri_of, with_tag, Action, ClientTransaction, Dialog,
-    ServerTransaction, Timer,
+    ack_for_2xx, cseq_parts, make_response, tag_of, uri_of, with_tag, Action, ClientTransaction,
+    Dialog, ServerState, ServerTransaction, Timer,
 };
 use sip_syntax::{canonical_header, parse_sdp, Header, Message, Method, Request, Response};
 
@@ -143,6 +143,7 @@ pub struct Switch {
     by_call_id: HashMap<String, u64>,
     next_tag: u64,
     next_call: u64,
+    next_branch: u64,
     free_rtp_ports: BTreeSet<u16>,
 }
 
@@ -159,8 +160,14 @@ impl Switch {
             by_call_id: HashMap::new(),
             next_tag: 0,
             next_call: 0,
+            next_branch: 0,
             free_rtp_ports,
         }
+    }
+
+    /// Drops expired registrations (call occasionally; cheap).
+    pub fn expire(&mut self, now_ms: u64) {
+        self.registrar.expire(now_ms);
     }
 
     /// Currently registered numbers.
@@ -363,6 +370,32 @@ impl Switch {
             return outputs;
         };
 
+        // RFC 3264 §6: never answer with a codec they did not offer. If the
+        // offer shares none of ours, the call cannot carry audio — refuse it
+        // instead of ringing into a dead line.
+        let offered = sdp_payload_types(&request.body);
+        if media_target(&request.body).is_some()
+            && !offered.is_empty()
+            && !offered
+                .iter()
+                .any(|pt| media::Codec::of_payload_type(*pt).is_some())
+        {
+            let response = tagged(
+                make_response(&request, 488, "Not Acceptable Here"),
+                &self.fresh_tag(),
+            );
+            let actions = caller_tx.on_response_from_user(response, now_ms);
+            push_sends(&mut outputs, actions);
+            outputs.push(Output::CallLog(call_log_line(
+                &caller_number,
+                &callee_number,
+                now_ms,
+                now_ms,
+                "no-codec",
+            )));
+            return outputs;
+        }
+
         // Media: if the caller offered audio, we relay it (docs/02 §8).
         let media = match media_target(&request.body) {
             Some(peer_addr) => match self.allocate_media_ports() {
@@ -406,6 +439,10 @@ impl Switch {
             .map(uri_of)
             .unwrap_or("")
             .to_string();
+        let caller_display = header(&request.headers, "from")
+            .map(sip_stack::display_name)
+            .unwrap_or("")
+            .to_string();
         let caller_tag = header(&request.headers, "from")
             .and_then(tag_of)
             .unwrap_or("")
@@ -417,8 +454,13 @@ impl Switch {
 
         // B2BUA: a brand-new leg toward the callee.
         let our_caller_tag = self.fresh_tag();
-        let callee_invite =
-            self.build_callee_invite(&request, &caller_uri, &callee_contact, callee_body);
+        let callee_invite = self.build_callee_invite(
+            &request,
+            &caller_uri,
+            &caller_display,
+            &callee_contact,
+            callee_body,
+        );
         let callee_call_id = header(&callee_invite.headers, "call-id")
             .unwrap_or("")
             .to_string();
@@ -486,6 +528,16 @@ impl Switch {
         let Some((id, leg)) = self.find_leg(&request) else {
             return vec![];
         };
+        // Only a live call can be refreshed; a re-INVITE after teardown gets
+        // 481 (no dead-session resurrections).
+        if self
+            .calls
+            .get(&id)
+            .is_none_or(|call| call.state != CallState::Answered)
+        {
+            let response = make_response(&request, 481, "Call/Transaction Does Not Exist");
+            return vec![Output::Send(Message::Response(response))];
+        }
         let mut outputs = Vec::new();
         let (mut tx, actions) = ServerTransaction::new(request.clone(), now_ms);
         push_sends(&mut outputs, actions);
@@ -527,29 +579,37 @@ impl Switch {
     // ----- in-dialog traffic ----------------------------------------------
 
     fn handle_response(&mut self, response: Response, now_ms: u64) -> Vec<Output> {
-        let Some(id) = self
-            .calls
-            .iter()
-            .find(|(_, call)| {
-                call.callee_tx
-                    .as_ref()
-                    .map(|tx| tx.matches_response(&response))
-                    .unwrap_or(false)
-            })
-            .map(|(id, _)| *id)
-        else {
-            // A retransmitted 2xx after our INVITE transaction finished:
-            // re-send our ACK (RFC 3261 §13.2.2.4).
+        // Responses to our own BYE/CANCEL transactions complete those
+        // transactions — they drive no call events.
+        let client_hit = self.calls.iter().find_map(|(id, call)| {
+            call.client_txs
+                .iter()
+                .position(|tx| tx.matches_response(&response))
+                .map(|index| (*id, index))
+        });
+        if let Some((id, index)) = client_hit {
+            let Some(call) = self.calls.get_mut(&id) else {
+                return vec![];
+            };
+            let actions = call.client_txs[index].on_response(response, now_ms);
+            let mut outputs = Vec::new();
+            push_sends(&mut outputs, actions);
+            return outputs;
+        }
+
+        // The callee INVITE transaction (or its late retransmissions).
+        let Some(id) = self.calls.iter().find_map(|(id, call)| {
+            call.callee_tx
+                .as_ref()
+                .filter(|tx| tx.matches_response(&response))
+                .map(|_| *id)
+        }) else {
             return self.re_ack(&response);
         };
         let Some(call) = self.calls.get_mut(&id) else {
             return vec![];
         };
-        let finished = call
-            .callee_tx
-            .as_ref()
-            .map(|tx| tx.is_finished())
-            .unwrap_or(true);
+        let finished = call.callee_tx.as_ref().is_none_or(|tx| tx.is_finished());
         if finished {
             // Only a retransmitted 2xx still needs an answer from us.
             return self.re_ack(&response);
@@ -561,9 +621,16 @@ impl Switch {
         self.apply_actions(&id, actions, now_ms)
     }
 
-    /// Re-ACKs a retransmitted 2xx for a call we still hold.
+    /// Re-ACKs a retransmitted 2xx of *our INVITE* for a call we still hold.
+    /// (Never for anything else — a BYE's 200 is not an INVITE's 2xx.)
     fn re_ack(&mut self, response: &Response) -> Vec<Output> {
-        if response.status < 200 || response.status >= 300 {
+        if !(200..300).contains(&response.status) {
+            return vec![];
+        }
+        let ours_invite = cseq_parts(header(&response.headers, "cseq").unwrap_or(""))
+            .map(|(_, method)| method.eq_ignore_ascii_case("INVITE"))
+            .unwrap_or(false);
+        if !ours_invite {
             return vec![];
         }
         let call_id = header(&response.headers, "call-id").unwrap_or("");
@@ -573,6 +640,12 @@ impl Switch {
         let Some(call) = self.calls.get_mut(&id) else {
             return vec![];
         };
+        let Some(invite) = &call.callee_invite else {
+            return vec![];
+        };
+        if sip_stack::branch(&invite.headers) != sip_stack::branch(&response.headers) {
+            return vec![];
+        }
         match &call.callee_ack {
             Some(ack) => vec![Output::Send(Message::Request(ack.clone()))],
             None => vec![],
@@ -582,7 +655,8 @@ impl Switch {
     fn handle_ack(&mut self, request: Request, now_ms: u64) -> Vec<Output> {
         // A non-2xx ACK shares its INVITE's branch; find that transaction and
         // let it finish (Timer I). A 2xx ACK is its own transaction and needs
-        // no state here.
+        // no state here. Only the matching transaction reacts — a stray ACK
+        // must not silence a legitimate 487 retransmission.
         let Some(&id) = self
             .by_call_id
             .get(header(&request.headers, "call-id").unwrap_or(""))
@@ -592,9 +666,13 @@ impl Switch {
         let Some(call) = self.calls.get_mut(&id) else {
             return vec![];
         };
-        let mut actions = call.caller_tx.on_ack(now_ms);
+        let ack_branch = sip_stack::branch(&request.headers);
+        let mut actions = Vec::new();
+        if call.caller_tx.branch() == ack_branch && ack_branch.is_some() {
+            actions.extend(call.caller_tx.on_ack(now_ms));
+        }
         for tx in &mut call.server_txs {
-            if tx.branch().is_some() && tx.branch() == sip_stack::branch(&request.headers) {
+            if tx.branch() == ack_branch && ack_branch.is_some() {
                 actions.extend(tx.on_ack(now_ms));
             }
         }
@@ -634,25 +712,51 @@ impl Switch {
     fn handle_cancel(&mut self, request: Request, now_ms: u64) -> Vec<Output> {
         let mut outputs = Vec::new();
         let call_id = header(&request.headers, "call-id").unwrap_or("");
-        let Some(&id) = self.by_call_id.get(call_id) else {
+        let cancel_branch = sip_stack::branch(&request.headers);
+        let refuse = |outputs: &mut Vec<Output>| {
+            // RFC 3261 §9.2: a CANCEL must match a transaction that still
+            // exists. After the INVITE is answered, it does not.
             let response = make_response(&request, 481, "Call/Transaction Does Not Exist");
-            return vec![Output::Send(Message::Response(response))];
+            outputs.push(Output::Send(Message::Response(response)));
         };
+
+        let Some(&id) = self.by_call_id.get(call_id) else {
+            refuse(&mut outputs);
+            return outputs;
+        };
+        let Some(call) = self.calls.get_mut(&id) else {
+            refuse(&mut outputs);
+            return outputs;
+        };
+
+        let cancels_call_setup = matches!(call.state, CallState::Offering | CallState::Ringing)
+            && cancel_branch.is_some()
+            && call.caller_tx.branch() == cancel_branch;
+        let cancels_reinvite = cancel_branch.is_some()
+            && call
+                .server_txs
+                .iter()
+                .any(|tx| tx.branch() == cancel_branch && tx.state() == ServerState::Proceeding);
+        if !(cancels_call_setup || cancels_reinvite) {
+            refuse(&mut outputs);
+            return outputs;
+        }
 
         // Answer the CANCEL itself.
         let (mut tx, actions) = ServerTransaction::new(request.clone(), now_ms);
         push_sends(&mut outputs, actions);
         let actions = tx.on_response_from_user(make_response(&request, 200, "OK"), now_ms);
         push_sends(&mut outputs, actions);
-        let Some(call) = self.calls.get_mut(&id) else {
-            return outputs;
-        };
-        call.server_txs.push(tx);
-
-        if !matches!(call.state, CallState::Offering | CallState::Ringing) {
-            return outputs; // too late to cancel; the call stands
+        if let Some(call) = self.calls.get_mut(&id) {
+            call.server_txs.push(tx);
         }
-        call.outcome = "cancelled".to_string();
+
+        if !cancels_call_setup {
+            return outputs; // a cancelled re-INVITE leaves the call alone
+        }
+        if let Some(call) = self.calls.get_mut(&id) {
+            call.outcome = "cancelled".to_string();
+        }
         let actions = self.event_on(&id, CallEvent::CallerCancelled, now_ms);
         outputs.extend(self.apply_actions(&id, actions, now_ms));
         outputs.extend(self.settle(&id, now_ms));
@@ -754,20 +858,38 @@ impl Switch {
                         CallEvent::CalleeProgress(response.status)
                     } else if response.status < 300 {
                         // ACK for the 2xx (new transaction, §13.2.2.4).
+                        let ack_via = self.via("ack");
+                        let contact = self.config.pbx_contact.clone();
                         let ack = self.calls.get(id).and_then(|call| {
                             let invite = call.callee_invite.as_ref()?;
-                            Some(ack_for_2xx(
-                                invite,
-                                &response,
-                                &self.via("ack"),
-                                &self.config.pbx_contact.clone(),
-                            ))
+                            Some(ack_for_2xx(invite, &response, &ack_via, &contact))
                         });
                         if let Some(ack) = ack {
                             if let Some(call) = self.calls.get_mut(id) {
                                 call.callee_ack = Some(ack.clone());
                             }
                             outputs.push(Output::Send(Message::Request(ack)));
+                        }
+                        // A CANCEL may have crossed this 200: the callee just
+                        // answered a call the caller already gave up on.
+                        // RFC 3261 §15.1.1 — hang that callee up.
+                        let over = self.calls.get(id).is_some_and(|call| {
+                            matches!(call.state, CallState::Terminating | CallState::Terminated)
+                        });
+                        if over {
+                            let bye_via = self.via("bye");
+                            let bye = self.calls.get_mut(id).and_then(|call| {
+                                call.callee_dialog
+                                    .as_mut()
+                                    .map(|dialog| dialog.request(Method::Bye, &bye_via, &contact))
+                            });
+                            if let Some(bye) = bye {
+                                let (tx, actions) = ClientTransaction::new(bye, now_ms);
+                                if let Some(call) = self.calls.get_mut(id) {
+                                    call.client_txs.push(tx);
+                                }
+                                push_sends(&mut outputs, actions);
+                            }
                         }
                         CallEvent::CalleeAnswered
                     } else {
@@ -985,11 +1107,18 @@ impl Switch {
         &mut self,
         caller_invite: &Request,
         caller_uri: &str,
+        caller_display: &str,
         callee_contact: &str,
         body: Vec<u8>,
     ) -> Request {
         let callee_aor = caller_invite.uri.clone();
         let from_tag = self.fresh_tag();
+        // Caller identity is carried over, display name included.
+        let from = if caller_display.is_empty() {
+            format!("<{caller_uri}>;tag={from_tag}")
+        } else {
+            format!("{caller_display} <{caller_uri}>;tag={from_tag}")
+        };
         Request {
             method: Method::Invite,
             uri: callee_contact.to_string(),
@@ -1004,7 +1133,7 @@ impl Switch {
                 },
                 Header {
                     name: "From".to_string(),
-                    value: format!("<{caller_uri}>;tag={from_tag}"),
+                    value: from,
                 },
                 Header {
                     name: "To".to_string(),
@@ -1044,13 +1173,11 @@ impl Switch {
         )
     }
 
-    fn via(&self, what: &str) -> String {
+    fn via(&mut self, what: &str) -> String {
+        self.next_branch += 1;
         format!(
-            "SIP/2.0/UDP {};branch=z9hG4bK-{}-{:06}-{:x}",
-            self.config.pbx_host,
-            what,
-            self.next_call + 1,
-            self.next_tag
+            "SIP/2.0/UDP {};branch=z9hG4bK-{}-{:08}",
+            self.config.pbx_host, what, self.next_branch
         )
     }
 }

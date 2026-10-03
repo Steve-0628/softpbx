@@ -50,6 +50,21 @@ pub struct Registrar {
 
 /// How many outstanding nonces to remember (plenty for a small office).
 const MAX_NONCES: usize = 1_024;
+/// How long a nonce stays acceptable (RFC 2617 §4.3 guidance: minutes).
+const NONCE_WINDOW_MS: u64 = 300_000;
+
+/// Whether a nonce we issued is still inside its replay window. Nonces are
+/// `"{issuance_ms:x}-{counter}"`.
+fn nonce_fresh(nonce: &str, now_ms: u64) -> bool {
+    let issued = nonce
+        .split('-')
+        .next()
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok());
+    match issued {
+        Some(issued) => now_ms.saturating_sub(issued) <= NONCE_WINDOW_MS,
+        None => false,
+    }
+}
 
 impl Registrar {
     /// Creates a registrar for the given devices.
@@ -79,7 +94,7 @@ impl Registrar {
             return make_response(request, 403, "Forbidden");
         };
 
-        if !self.is_authorized(request, &device) {
+        if !self.is_authorized(request, &device, now_ms) {
             let challenge = Challenge {
                 realm: self.realm.clone(),
                 nonce: self.next_nonce(now_ms),
@@ -171,19 +186,19 @@ impl Registrar {
         &self.realm
     }
 
-    fn is_authorized(&self, request: &Request, device: &Device) -> bool {
+    fn is_authorized(&self, request: &Request, device: &Device, now_ms: u64) -> bool {
         let Some(value) = header(&request.headers, "authorization") else {
             return false;
         };
         let Some(credentials) = digest::parse_authorization(value) else {
             return false;
         };
-        // Only nonces we issued verify: a sniffed response cannot be replayed
-        // to rebind someone else's number.
+        // Only nonces we issued, and only recently: a sniffed response cannot
+        // be replayed to rebind someone else's number.
         if !self
             .issued_nonces
             .iter()
-            .any(|nonce| nonce == &credentials.nonce)
+            .any(|nonce| nonce == &credentials.nonce && nonce_fresh(nonce, now_ms))
         {
             return false;
         }

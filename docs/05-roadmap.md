@@ -53,7 +53,7 @@ local softphones are verified, before any fax work.
 
 ## Step 5 — Analog devices, fax, modems (only if wanted)
 
-- Document gateway setup (docs/06); analog phones appear as SIP endpoints
+- Document gateway setup (docs/06); analog phones appear as SIP devices
 - Fax and dial-up modem traffic over G.711 pass-through (the transparent audio
   path from docs/02 §8 makes this possible without rework); T.38 relay only if
   testing shows pass-through is not enough

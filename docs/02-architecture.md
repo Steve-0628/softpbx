@@ -94,19 +94,25 @@ same goes for future ring groups and trunk definitions.
 - One append-only NDJSON call log: one line per call with the caller, the
   callee, start/end offsets in milliseconds since the daemon started, and the
   outcome. This is what answers "why did that call fail?" later on. Lines are
-  appended and never rewritten; a torn last line after a crash is ignored on
-  startup.
+  appended and never rewritten, and nothing ever reads the file back — it is
+  for humans (and `jq`).
 
 ## 6. Security posture
 
 The system runs on a trusted office network or VPN. What we still do:
 
-- Digest authentication for phone registrations; a phone without the right
-  password cannot register or make calls.
+- Digest authentication for phone registrations: without the right password a
+  device cannot register. Call admission then requires a live registration.
 - Clear refusal of malformed or oversized SIP messages (no panics, no unbounded
   memory growth).
 - No remote management surface at all, which is the simplest possible attack
   surface reduction.
+
+What we deliberately do **not** do: verify that an INVITE's `From` really is
+who it claims (any registered device can present any caller ID — phones do
+this anyway for legitimate reasons), challenge INVITEs themselves, or track
+devices by network address. On a hostile network none of this is enough; that
+is what the "trusted network" premise means.
 
 We explicitly do not implement TLS, SRTP, intrusion detection, or rate limiting
 beyond basic sanity limits.

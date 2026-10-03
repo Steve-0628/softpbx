@@ -9,7 +9,7 @@ seed.**
 
 | Layer | What it covers |
 | --- | --- |
-| Unit tests | Pure functions: SIP parsing, routing rule matching, call state transitions |
+| Unit tests | Pure functions: SIP parsing, digest math, call state transitions (routing rules when they exist) |
 | Simulation tests (`engine-sim`) | Whole calls driven through a deterministic test bed — the main test surface |
 | Real-phone smoke tests | A handful of manual (later scripted) runs against actual softphones |
 | Fuzzing | The SIP parser must survive arbitrary garbage input |
@@ -23,9 +23,11 @@ sleeping.
   Nothing depends on wall-clock time, so no flaky timing tests.
 - **Event queue.** Everything — incoming SIP messages, timers, RTP packets —
   is an event in one queue, processed one at a time in a defined order.
-- **Fake phones.** Small in-process SIP endpoints: a phone that registers and
-  answers, a phone that rejects, a phone that hangs up at the wrong moment.
-  They speak real SIP messages; only the transport is virtual.
+- **Phones are played by the tests.** Each test speaks real SIP: it builds
+  message bytes (registration, INVITE, BYE, whatever the scenario needs) and
+  feeds them to the switch. The switch answers with real bytes back. There is
+  no phone component to maintain — the tests *are* the phones, which also
+  means they can play badly behaved ones.
 - **Fixed seed.** Any randomness (e.g. simulated packet loss) comes from a
   seeded generator. Same seed ⇒ same run.
 
@@ -66,8 +68,9 @@ assumptions.
 ## 5. Fuzzing
 
 The SIP parser (`sip-syntax`) is the attack surface and the panic risk. It gets
-a fuzz target run in CI for a short time on every change, longer runs weekly.
-Findings are frozen into fixed test cases.
+a fuzz target run in CI for a short time on every change. (Longer runs are
+worth doing before risky work — trunk interop, say — but there is no scheduled
+job today.) Findings are frozen into fixed test cases.
 
 ## 6. CI
 

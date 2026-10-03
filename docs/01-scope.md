@@ -25,12 +25,12 @@ one team can hold entirely in their heads.
 
 - Hold and transfer (blind / attended). Not wanted yet; the call state machine
   and the B2BUA model leave room for them.
-- Ring groups: ring several endpoints at once, first to answer takes the call,
+- Ring groups: ring several devices at once, first to answer takes the call,
   the others stop ringing.
 - SIP trunk to a remote MikoPBX-compatible PBX: calls between sites, number
   range routing (site A owns 2xx, site B owns 3xx).
-- Analog endpoints via an external analog gateway (Yamaha NVR500/510-class):
-  analog phones, fax machines and modems appear as SIP endpoints. The gateway
+- Analog devices via an external analog gateway (Yamaha NVR500/510-class):
+  analog phones, fax machines and modems appear as SIP devices. The gateway
   is configured by hand; we only document the settings.
 - Fax and dial-up modem traffic: not implemented in the first phase. The design
   reserves room for them (docs/06); they arrive when there is a real need, and

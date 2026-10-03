@@ -18,8 +18,9 @@ A wrong password gets rejected. An unknown number gets rejected.
 Alice (1001) picks up her phone and dials 1002.
 
 1. Her phone sends an **INVITE** to the PBX saying "connect me to 1002".
-2. The PBX looks at its **call routing rules** and decides 1002 is a number on
-   this system — Bob's phone, which is registered and can be rung.
+2. The PBX decides where the call goes: today that means "is 1002 a number on
+   this system?" (call routing rules — pattern matching, rewriting — are
+   roadmap step 3, docs/05).
 3. The PBX sends an INVITE to Bob's phone. Bob's phone starts **ringing**.
 4. Bob picks up. His phone says "OK".
 5. The PBX tells Alice's phone "OK" too, and from now on it forwards audio
@@ -91,7 +92,7 @@ When this happens, the SIP subset grows `REFER`/`NOTIFY` support
 
 ## 6. Ring groups (later)
 
-A routing rule pointing at a group of endpoints instead of one: all of them
+A routing rule pointing at a group of devices instead of one: all of them
 ring at the same time, the first to answer gets the call, the rest stop
 ringing. Cheap to add on this model, but not wanted yet — so it is not in v1.
 

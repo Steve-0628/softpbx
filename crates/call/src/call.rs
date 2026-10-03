@@ -1,4 +1,4 @@
-//! The call state machine (docs/02 §4, docs/03 §3).
+//! The call state machine (docs/03 §3).
 //!
 //! Pure: `transit(state, event) -> (state, commands)`. No I/O, no time, no
 //! messages — the commands are *semantic* ("ring the caller", "hang up the

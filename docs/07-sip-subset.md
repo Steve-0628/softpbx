@@ -35,8 +35,9 @@ for now: hold and transfer are not in the first phase, docs/01.)
 - Quoted display names and escaped characters in URIs. URI validation stays
   loose: we copy and compare, we don't audit.
 - Body delimited by `Content-Length`, trimmed to the datagram.
-- Resource limits: max line length, max header count, max body size. Over the
-  limit → `400`/`413`.
+- Resource limits: max message size, line length, header count, body size.
+  Over the limit → the parser refuses the message; the daemon drops such
+  datagrams (no response — nothing to answer).
 - Malformed input → an error value. **Never a panic, never unbounded memory.**
 
 ### Transactions (RFC 3261 §17)
@@ -55,14 +56,15 @@ for now: hold and transfer are not in the first phase, docs/01.)
   are swept.
 - Digest authentication (MD5, with and without `qop`): `REGISTER` is
   challenged, wrong password → `401`, unknown number → `403`. Only nonces we
-  issued verify, so a sniffed response cannot be replayed.
+  issued verify within a five-minute window, so a sniffed response cannot be replayed.
 - **Only registered devices may place calls**: an `INVITE` whose caller has no
   live binding gets `403`. (No digest challenge on `INVITE` itself — being
   registered is the admission ticket.)
 
 ### NAT hygiene
-- `rport` / `received` (RFC 3581) on responses. Cheap, and it is why phones
-  behind a router work at all.
+- `rport` / `received` (RFC 3581) processing is not implemented — instead,
+  responses go back to the network address their request came from, which is
+  what makes phones behind a router work at all.
 
 ### Offer/answer and SDP
 - The RFC 3264 exchange, once per call leg (we re-originate both sides).
@@ -77,8 +79,8 @@ for now: hold and transfer are not in the first phase, docs/01.)
 
 Originated by us: `100` (auto), `180`/`183` (callee progress, forwarded with
 its real code), `200`, `400`, `401`, `403`, `404`, `405`, `408`, `481`, `487`,
-`503`. Final responses from the callee are forwarded as-is (a `486` from a busy
-phone arrives as `486`). `488`, `491` and `500` are defined for later use.
+`488`, `503`. Final responses from the callee are forwarded as-is (a `486`
+from a busy phone arrives as `486`). `491` and `500` are defined for later use.
 Nothing else needs to exist in the code.
 
 ## 2. Not implemented (on purpose)

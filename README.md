@@ -42,7 +42,7 @@ endpoints.
 
 ```
 softpbx/
-├── docs/            design docs (01-06, read in order)
+├── docs/            design docs (01-09, read in order)
 ├── crates/
 │   ├── sip-syntax/  SIP message and SDP parsing (pure, no I/O)
 │   ├── sip-stack/   transport, transactions, dialogs

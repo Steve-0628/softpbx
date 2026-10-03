@@ -1,17 +1,13 @@
-//! SIP transactions (RFC 3261 §17).
+//! SIP transactions (RFC 3261 §17, plus RFC 6026 for 2xx handling).
 //!
 //! Transport-agnostic and side-effect free: inputs take `now_ms` explicitly,
 //! outputs are [`Action`]s for the caller to execute. That is what lets the
 //! deterministic simulation (docs/04) drive retransmission timers exactly.
 //!
 //! Covered here: INVITE and non-INVITE client/server transactions over an
-//! unreliable transport (UDP), i.e. retransmission, timeouts, and `100 Trying`.
-//! Simplifications, deliberate (docs/07):
-//!
-//! - 2xx retransmission on the server side is a dialog-layer job (RFC 6026);
-//!   we terminate the server transaction on 2xx and handle it in phase 4.
-//! - Timer K (absorbing retransmitted responses to a finished non-INVITE
-//!   client transaction) is skipped: a late response is simply unmatched.
+//! unreliable transport (UDP) — retransmission, timeouts, `100 Trying`, the
+//! RFC 6026 "Accepted" state for sent 2xx responses, and the 2xx ACK shape
+//! (§13.2.2.4). The switch above owns dialogs and decides when to send what.
 
 use sip_syntax::{canonical_header, Header, Message, Method, Request, Response};
 
@@ -248,24 +244,23 @@ impl ClientTransaction {
     /// Whether this response belongs to this transaction (Via branch + CSeq
     /// method; falls back to Call-ID + CSeq number when a branch is missing).
     pub fn matches_response(&self, response: &Response) -> bool {
+        // The CSeq method tells INVITE and CANCEL apart — they share a branch.
+        let method_ok = match cseq_parts(header(&response.headers, "cseq").unwrap_or("")) {
+            Some((_, method)) => method.eq_ignore_ascii_case(self.request.method.as_str()),
+            None => true,
+        };
+        if !method_ok {
+            return false;
+        }
         let mine = branch(&self.request.headers);
         let theirs = branch(&response.headers);
-        let branch_ok = match (mine, theirs) {
+        match (mine, theirs) {
             (Some(a), Some(b)) => a == b,
             _ => {
-                return header(&self.request.headers, "call-id")
-                    == header(&response.headers, "call-id")
+                header(&self.request.headers, "call-id") == header(&response.headers, "call-id")
                     && cseq_number(&self.request.headers) == cseq_number(&response.headers)
                     && header(&self.request.headers, "call-id").is_some()
             }
-        };
-        if !branch_ok {
-            return false;
-        }
-        // CANCEL shares the INVITE's branch; the CSeq method tells them apart.
-        match cseq_parts(header(&response.headers, "cseq").unwrap_or("")) {
-            Some((_, method)) => method.eq_ignore_ascii_case(self.request.method.as_str()),
-            None => true,
         }
     }
 

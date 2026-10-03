@@ -89,23 +89,35 @@ impl Dialog {
     }
 
     /// Whether an in-dialog message belongs to this dialog: same Call-ID,
-    /// their tag on From, our tag on To.
+    /// their tag on From, our tag on To. All three must match — a request
+    /// without our To-tag is not in this dialog (an initial INVITE's
+    /// retransmission, for instance, is not a re-INVITE).
     pub fn matches(&self, call_id: &str, from_tag: &str, to_tag: &str) -> bool {
-        self.call_id == call_id
-            && self.remote_tag == from_tag
-            && (self.local_tag == to_tag || to_tag.is_empty())
+        self.call_id == call_id && self.remote_tag == from_tag && self.local_tag == to_tag
+    }
+}
+
+/// The display name in a `From`/`To` value (`"Alice" <sip:a@b>` → `"Alice"`),
+/// or an empty string when there is none. Quotes are kept as written.
+pub fn display_name(value: &str) -> &str {
+    match value.find('<') {
+        Some(start) if start > 0 => value[..start].trim(),
+        _ => "",
     }
 }
 
 /// The URI inside a header value: takes what is between `<...>`, skipping any
-/// display name (`"Alice" <sip:alice@host>`), and strips `;params` otherwise.
+/// display name (`"Alice" <sip:alice@host>`), and strips `;params`
+/// (`<sip:a@host;transport=udp>` → `sip:a@host`).
 pub fn uri_of(value: &str) -> &str {
     let value = value.trim();
-    if let Some(start) = value.find('<') {
+    let inner = if let Some(start) = value.find('<') {
         let rest = &value[start + 1..];
-        return rest.split('>').next().unwrap_or(rest).trim();
-    }
-    value.split(';').next().unwrap_or(value).trim()
+        rest.split('>').next().unwrap_or(rest).trim()
+    } else {
+        value
+    };
+    inner.split(';').next().unwrap_or(inner).trim()
 }
 
 /// The `tag=` parameter of a `From`/`To` header value, if any.

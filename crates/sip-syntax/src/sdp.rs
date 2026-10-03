@@ -77,11 +77,15 @@ pub fn parse_sdp(input: &[u8]) -> Result<Sdp, ParseError> {
     Ok(Sdp { media })
 }
 
-/// `c=IN IP4 192.0.2.1` → "192.0.2.1" (the last field).
+/// `c=IN IP4 192.0.2.1` → "192.0.2.1" (the last field, without any `/ttl`
+/// or `/number-of-addresses` suffix).
 fn parse_connection_line(fields: &[u8]) -> String {
     let line = String::from_utf8_lossy(fields);
     line.split_whitespace()
         .last()
+        .unwrap_or("")
+        .split('/')
+        .next()
         .unwrap_or("")
         .trim()
         .to_string()

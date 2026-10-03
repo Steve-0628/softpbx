@@ -33,8 +33,44 @@ struct Pbx {
     /// One socket per media relay port (two per call).
     rtp: HashMap<u16, Arc<UdpSocket>>,
     /// Where responses go: Via branch → where its request came from.
-    response_route: Mutex<HashMap<String, SocketAddr>>,
+    response_route: Mutex<ResponseRoutes>,
     call_log: Mutex<std::fs::File>,
+}
+
+/// Response routing: branch → (source address, insertion order). Bounded:
+/// the oldest entries are evicted when it grows too large.
+struct ResponseRoutes {
+    next_seq: u64,
+    map: HashMap<String, (SocketAddr, u64)>,
+}
+
+impl ResponseRoutes {
+    fn new() -> Self {
+        ResponseRoutes {
+            next_seq: 0,
+            map: HashMap::new(),
+        }
+    }
+
+    fn remember(&mut self, branch: String, source: SocketAddr) {
+        self.next_seq += 1;
+        self.map.insert(branch, (source, self.next_seq));
+        if self.map.len() > 4_096 {
+            let mut by_age: Vec<(u64, String)> = self
+                .map
+                .iter()
+                .map(|(branch, (_, seq))| (*seq, branch.clone()))
+                .collect();
+            by_age.sort();
+            for (_, branch) in by_age.into_iter().take(1_024) {
+                self.map.remove(&branch);
+            }
+        }
+    }
+
+    fn lookup(&self, branch: &str) -> Option<SocketAddr> {
+        self.map.get(branch).map(|(source, _)| *source)
+    }
 }
 
 impl Pbx {
@@ -56,12 +92,10 @@ impl Pbx {
         };
         if let Message::Request(request) = &message {
             if let Some(branch) = sip_stack::branch(&request.headers) {
-                let mut routes = self.response_route.lock().expect("lock");
-                // Bounded: old branches only matter for one transaction.
-                if routes.len() > 4_096 {
-                    routes.clear();
-                }
-                routes.insert(branch.to_string(), source);
+                self.response_route
+                    .lock()
+                    .expect("lock")
+                    .remember(branch.to_string(), source);
             }
         }
         let outputs = self
@@ -82,9 +116,11 @@ impl Pbx {
         self.dispatch(outputs, None).await;
     }
 
-    /// Fires whatever transaction timers are due.
+    /// Fires whatever transaction timers are due, and sweeps expired
+    /// registrations now and then.
     async fn tick(&self) {
         let now = self.now_ms();
+        self.switch.lock().expect("lock").expire(now);
         let due: Vec<String> = self
             .switch
             .lock()
@@ -114,14 +150,10 @@ impl Pbx {
                 Output::Send(message) => {
                     let bytes = serialize_message(&message);
                     let destination = match &message {
-                        // Responses go where the request came from (rport).
+                        // Responses go back where their request came from.
                         Message::Response(response) => sip_stack::branch(&response.headers)
                             .and_then(|branch| {
-                                self.response_route
-                                    .lock()
-                                    .expect("lock")
-                                    .get(branch)
-                                    .copied()
+                                self.response_route.lock().expect("lock").lookup(branch)
                             })
                             .or(reply_to),
                         // Requests go to their request-URI (a contact address).
@@ -180,10 +212,20 @@ fn start_line(message: &Message) -> String {
     }
 }
 
-/// Resolves a request-URI to an address. No DNS (docs/07): peers are IPs.
+/// Resolves a request-URI to an address. No DNS (docs/07): peers are IP
+/// literals. Handles display names, URI parameters and missing user parts:
+/// `<sip:1001@192.0.2.1:5060;transport=udp>` → `192.0.2.1:5060`,
+/// `sip:192.0.2.1` → `192.0.2.1:5060`.
 fn resolve_uri(uri: &str) -> Option<SocketAddr> {
     let address = sip_stack::uri_of(uri);
+    let address = address
+        .strip_prefix("sips:")
+        .or_else(|| address.strip_prefix("sip:"))
+        .unwrap_or(address);
     let hostport = address.rsplit('@').next().unwrap_or(address).trim();
+    if hostport.is_empty() {
+        return None;
+    }
     if hostport.contains(':') {
         hostport.parse().ok()
     } else {
@@ -213,9 +255,10 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("cannot bind SIP socket {}", config.general.sip_bind))?;
     let mut rtp = HashMap::new();
-    for port in
-        config.general.rtp_port_base..config.general.rtp_port_base + config.general.rtp_ports
-    {
+    let first_port = u32::from(config.general.rtp_port_base);
+    let last_port = first_port + u32::from(config.general.rtp_ports);
+    for port in first_port..last_port {
+        let port = port as u16;
         let socket = UdpSocket::bind(("0.0.0.0", port))
             .await
             .with_context(|| format!("cannot bind media port {port}"))?;
@@ -228,7 +271,7 @@ async fn main() -> anyhow::Result<()> {
         started: Instant::now(),
         sip,
         rtp,
-        response_route: Mutex::new(HashMap::new()),
+        response_route: Mutex::new(ResponseRoutes::new()),
         call_log: Mutex::new(call_log),
     });
 
@@ -286,4 +329,52 @@ async fn main() -> anyhow::Result<()> {
         .context("waiting for Ctrl-C")?;
     log("shutting down (established calls are dropped; devices will re-register)");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_uri;
+    use std::net::SocketAddr;
+
+    fn addr(text: &str) -> SocketAddr {
+        text.parse().expect("address")
+    }
+
+    #[test]
+    fn resolves_real_world_contact_shapes() {
+        // Plain, with user, with port.
+        assert_eq!(
+            resolve_uri("sip:bob@192.0.2.2:5060"),
+            Some(addr("192.0.2.2:5060"))
+        );
+        // URI parameters (Grandstream `;transport=`, Aastra `;line=`, ...).
+        assert_eq!(
+            resolve_uri("sip:1001@192.0.2.1:5060;transport=UDP"),
+            Some(addr("192.0.2.1:5060"))
+        );
+        // Bracketed, with display name and parameters.
+        assert_eq!(
+            resolve_uri("\"Alice\" <sip:1001@192.0.2.1:5060;line=1>"),
+            Some(addr("192.0.2.1:5060"))
+        );
+        // No user part at all.
+        assert_eq!(
+            resolve_uri("sip:192.0.2.1:5060"),
+            Some(addr("192.0.2.1:5060"))
+        );
+        // No port: SIP's default.
+        assert_eq!(
+            resolve_uri("sip:alice@192.0.2.1"),
+            Some(addr("192.0.2.1:5060"))
+        );
+    }
+
+    #[test]
+    fn refuses_what_it_cannot_use() {
+        // No DNS (docs/07): hostnames are not resolved.
+        assert_eq!(resolve_uri("sip:bob@example.com:5060"), None);
+        assert_eq!(resolve_uri("sip:bob@example.com"), None);
+        assert_eq!(resolve_uri(""), None);
+        assert_eq!(resolve_uri("<sip:>"), None);
+    }
 }

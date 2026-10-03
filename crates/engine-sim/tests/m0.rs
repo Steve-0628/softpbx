@@ -1387,3 +1387,347 @@ fn cancel_bytes(from: &str, call_id: &str, to_tag: &str) -> Vec<u8> {
     )
     .into_bytes()
 }
+
+// ----- regressions round 2 (the second review round) ------------------------
+
+/// A CANCEL that crosses the callee's 200 must still hang that callee up
+/// (RFC 3261 §15.1.1) — the zombie-connected-callee bug.
+#[test]
+fn regression_cancel_crossing_200_sends_bye() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite_bytes("1001", "1002", "reg-cross", "192.0.2.1:10000"),
+    );
+    let callee_invite = request_of(&outputs, Method::Invite);
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(&callee_invite, 180, "Ringing", "bob1", b""),
+    );
+    let ringing = response_of(&outputs, 180);
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &cancel_bytes(
+            "1001",
+            "reg-cross",
+            tag_of(header_value(&ringing.headers, "to").unwrap()).unwrap(),
+        ),
+    );
+    assert_eq!(requests_of(&outputs, Method::Cancel).len(), 1);
+
+    // The callee's 200 crosses our CANCEL: he answered a dead call.
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(
+            &callee_invite,
+            200,
+            "OK",
+            "bob1",
+            &sdp_body("192.0.2.2:20000"),
+        ),
+    );
+    assert_eq!(
+        requests_of(&outputs, Method::Ack).len(),
+        1,
+        "the 200 is ACKed: {outputs:?}"
+    );
+    assert_eq!(
+        requests_of(&outputs, Method::Bye).len(),
+        1,
+        "and the zombie callee is hung up: {outputs:?}"
+    );
+}
+
+/// The 200 for our own BYE completes that transaction: no stray ACK toward
+/// the callee, and the BYE stops being retransmitted (the F1 half-fix).
+#[test]
+fn regression_bye_200_is_absorbed_quietly() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let call = establish_call(
+        &mut world,
+        &mut switch,
+        "reg-bye-quiet",
+        "1001",
+        "1002",
+        "192.0.2.1:10000",
+        "192.0.2.2:20000",
+    );
+
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &bye_bytes(
+            "1001",
+            "sip:192.0.2.10:5060",
+            &call.to_tag,
+            &call.call_id,
+            2,
+        ),
+    );
+    let our_bye = request_of(&outputs, Method::Bye);
+
+    // Bob answers our BYE.
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(&our_bye, 200, "OK", "bob1", b""),
+    );
+    assert!(
+        requests_of(&outputs, Method::Ack).is_empty(),
+        "a BYE's 200 must NOT be ACKed like an INVITE's 2xx: {outputs:?}"
+    );
+    assert!(requests_of(&outputs, Method::Bye).is_empty());
+
+    // And the answered BYE stops being retransmitted.
+    let mut byes_after = 0;
+    loop {
+        let timers = switch.timers();
+        if timers.is_empty() {
+            break;
+        }
+        for (name, due) in timers {
+            world.arm(name, due);
+        }
+        while let Some(event) = world.next_event() {
+            if let Event::Timer { name } = event {
+                byes_after +=
+                    requests_of(&switch.on_timer(&name, world.now_ms()), Method::Bye).len();
+            }
+        }
+    }
+    assert_eq!(byes_after, 0, "no retransmitted BYE after its 200");
+}
+
+/// Every transaction gets its own Via branch (two calls must not collide).
+#[test]
+fn regression_via_branches_are_unique() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let one = establish_call(
+        &mut world,
+        &mut switch,
+        "reg-branch-1",
+        "1001",
+        "1002",
+        "192.0.2.1:10000",
+        "192.0.2.2:20000",
+    );
+    let two = establish_call(
+        &mut world,
+        &mut switch,
+        "reg-branch-2",
+        "1001",
+        "1002",
+        "192.0.2.1:10002",
+        "192.0.2.2:20002",
+    );
+    let bye_one = feed(
+        &mut world,
+        &mut switch,
+        &bye_bytes("1001", "sip:192.0.2.10:5060", &one.to_tag, &one.call_id, 2),
+    );
+    let bye_two = feed(
+        &mut world,
+        &mut switch,
+        &bye_bytes("1001", "sip:192.0.2.10:5060", &two.to_tag, &two.call_id, 2),
+    );
+    let bye_one_request = request_of(&bye_one, Method::Bye);
+    let bye_two_request = request_of(&bye_two, Method::Bye);
+    let branch_one = sip_stack::branch(&bye_one_request.headers).unwrap();
+    let branch_two = sip_stack::branch(&bye_two_request.headers).unwrap();
+    assert_ne!(branch_one, branch_two, "BYEs carry distinct branches");
+}
+
+/// A re-INVITE for a call that has ended gets 481, not a dead 200.
+#[test]
+fn regression_reinvite_after_teardown_is_481() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let call = establish_call(
+        &mut world,
+        &mut switch,
+        "reg-dead-reinvite",
+        "1001",
+        "1002",
+        "192.0.2.1:10000",
+        "192.0.2.2:20000",
+    );
+    let _ = feed(
+        &mut world,
+        &mut switch,
+        &bye_bytes(
+            "1001",
+            "sip:192.0.2.10:5060",
+            &call.to_tag,
+            &call.call_id,
+            2,
+        ),
+    );
+
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &reinvite_bytes(
+            &call.call_id,
+            "1001",
+            "from1",
+            &call.to_tag,
+            3,
+            "192.0.2.1:10000",
+        ),
+    );
+    assert_eq!(
+        response_of(&outputs, 481).status,
+        481,
+        "no dead-session resurrections: {outputs:?}"
+    );
+}
+
+/// A CANCEL for an answered call gets 481 (RFC 3261 §9.2).
+#[test]
+fn regression_cancel_after_answer_is_481() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let call = establish_call(
+        &mut world,
+        &mut switch,
+        "reg-late-cancel",
+        "1001",
+        "1002",
+        "192.0.2.1:10000",
+        "192.0.2.2:20000",
+    );
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &cancel_bytes("1001", &call.call_id, &call.to_tag),
+    );
+    assert_eq!(
+        response_of(&outputs, 481).status,
+        481,
+        "the INVITE's transaction no longer exists: {outputs:?}"
+    );
+    assert_eq!(switch.active_calls(), 1, "the call is untouched");
+}
+
+/// An offer we share no codec with gets 488, not a ringing dead line.
+#[test]
+fn regression_no_shared_codec_is_488() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    // GSM (payload 3) only — a codec we do not speak.
+    let body = "v=0\r\n\
+         o=x 1 1 IN IP4 192.0.2.1\r\n\
+         s=-\r\n\
+         c=IN IP4 192.0.2.1\r\n\
+         t=0 0\r\n\
+         m=audio 10000 RTP/AVP 3\r\n";
+    let invite = format!(
+        "INVITE sip:1002@192.0.2.10 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-reg-codec\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:1001@192.0.2.10>;tag=from1\r\n\
+         To: <sip:1002@192.0.2.10>\r\n\
+         Call-ID: reg-codec\r\n\
+         CSeq: 1 INVITE\r\n\
+         Contact: <sip:1001@192.0.2.1:5060>\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+
+    let outputs = feed(&mut world, &mut switch, invite.as_bytes());
+    assert_eq!(
+        response_of(&outputs, 488).status,
+        488,
+        "no shared codec: {outputs:?}"
+    );
+    let logs = call_logs(&outputs);
+    assert!(logs[0].contains("\"result\":\"no-codec\""), "{}", logs[0]);
+}
+
+/// Caller display names survive into the callee leg (caller-ID).
+#[test]
+fn regression_display_name_caller_id_preserved() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let text =
+        String::from_utf8(invite_bytes("1001", "1002", "reg-cid", "192.0.2.1:10000")).unwrap();
+    let with_name = text.replace("From: <sip:1001@", "From: \"Alice\" <sip:1001@");
+    let outputs = feed(&mut world, &mut switch, with_name.as_bytes());
+    let callee_invite = request_of(&outputs, Method::Invite);
+    let from = header_value(&callee_invite.headers, "from").unwrap();
+    assert!(
+        from.starts_with("\"Alice\" <sip:1001@"),
+        "display name carried over: {from}"
+    );
+}
+
+/// The retention/GC contract: a finished call lingers only while its
+/// transactions have obligations, then disappears.
+#[test]
+fn regression_retained_calls_are_garbage_collected() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let call = establish_call(
+        &mut world,
+        &mut switch,
+        "reg-gc",
+        "1001",
+        "1002",
+        "192.0.2.1:10000",
+        "192.0.2.2:20000",
+    );
+    let _ = feed(
+        &mut world,
+        &mut switch,
+        &bye_bytes(
+            "1001",
+            "sip:192.0.2.10:5060",
+            &call.to_tag,
+            &call.call_id,
+            2,
+        ),
+    );
+    assert_eq!(switch.active_calls(), 0);
+    assert!(
+        switch.retained_calls() > 0,
+        "kept around to answer late retransmissions"
+    );
+
+    // Once every transaction timer has run its course, it is gone for good.
+    loop {
+        let timers = switch.timers();
+        if timers.is_empty() {
+            break;
+        }
+        for (name, due) in timers {
+            world.arm(name, due);
+        }
+        while let Some(event) = world.next_event() {
+            if let Event::Timer { name } = event {
+                let _ = switch.on_timer(&name, world.now_ms());
+            }
+        }
+    }
+    assert_eq!(
+        switch.retained_calls(),
+        0,
+        "nothing leaks once obligations end"
+    );
+}
