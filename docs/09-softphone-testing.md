@@ -50,8 +50,40 @@ round 1 stands: **test both directions of everything with real phones.**
 - All of it runs headless; no audio hardware is needed for signaling, and RTP
   flows regardless.
 
-## 4. Next rounds
+## 4. Round 2 (phase 7 hardening)
 
-- twinkle as a third phone; SIPp scenarios for stress (many calls).
+Scripted regression over real phones (`/tmp/opencode/softpbx/round2.sh`) plus a
+real-socket stress tool (`stress.py`: fake phones that digest-register and run
+full INVITE/200/ACK/RTP/BYE flows):
+
+| Check | Result |
+| --- | --- |
+| Caller-side hang-up (linphone BYE) | ✅ `completed`, logged |
+| **Callee-side hang-up** (baresip quits with BYE) | ✅ `completed`, logged — this was the review-critical bug; verified on real phones now |
+| Daemon restart mid-call | calls drop (by design); phones re-register on their own interval; SIGTERM now exits as cleanly as Ctrl-C (fixed) |
+| Keepalives over the whole run | ✅ zero "unparsable" noise |
+| 50 concurrent real-socket calls | ✅ 50/50 completed, exactly 50 call-log lines, zero parser noise |
+| Soak (300 × 10 calls, background) | running; assertions are per-loop completion counts |
+
+Adversarial probes (the "evil peer" set), all locked as golden tests in
+`crates/engine-sim/tests/m0.rs`:
+
+| Probe | Behavior |
+| --- | --- |
+| `Require: 100rel, timer` | `400`? no — `420 Bad Extension` + `Unsupported` (docs/07 rule: never half an extension) |
+| `UPDATE` / `PRACK` / `REFER` | `405` + `Allow` |
+| `Session-Expires: 1800;refresher=uas` | answered `200` with `Session-Expires: 1800;refresher=uac` — the peer times and refreshes; our re-INVITE handling absorbs it |
+| INVITE without Contact | `400` (RFC 3261 §8.1.1.8 — no Contact means an unhangupable call) |
+| Simultaneous re-INVITE ("glare") | each leg answered independently with the session unchanged — by design, and covered per leg |
+
+Harness lessons (why two of these took debugging): test tools must send a
+request *line*, BYEs must carry the *right dialog leg's* tag, and probe
+sockets must be drained between checks — each of these produced a convincing
+"the PBX is broken" symptom that was the harness's own bug. The PBX's own
+failures so far have all been found by tests and reviewers instead.
+
+## 5. Next rounds
+
+- twinkle as a third phone; a hardphone when one is available
 - The same recipe against a **MikoPBX trunk** (roadmap step 4) — interop
-  findings get recorded here per device.
+  findings get recorded here per device

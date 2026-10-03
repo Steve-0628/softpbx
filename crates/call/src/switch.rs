@@ -346,6 +346,22 @@ impl Switch {
         let (mut caller_tx, actions) = ServerTransaction::new(request.clone(), now_ms);
         push_sends(&mut outputs, actions);
 
+        // RFC 3261 §8.1.1.8: an INVITE must carry a Contact — it is where we
+        // send BYE later. Without one the call would be unhangupable.
+        if header(&request.headers, "contact")
+            .map(uri_of)
+            .unwrap_or("")
+            .is_empty()
+        {
+            let response = tagged(
+                make_response(&request, 400, "Bad Request"),
+                &self.fresh_tag(),
+            );
+            let actions = caller_tx.on_response_from_user(response, now_ms);
+            push_sends(&mut outputs, actions);
+            return outputs;
+        }
+
         // Only registered devices may place calls (docs/02 §6, docs/07).
         if !self.registrar.is_registered(&caller_number, now_ms) {
             let response = tagged(make_response(&request, 403, "Forbidden"), &self.fresh_tag());

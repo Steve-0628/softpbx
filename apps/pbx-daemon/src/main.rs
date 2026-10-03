@@ -324,6 +324,18 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Ctrl-C and SIGTERM (`systemctl stop`, `pkill`) both shut down cleanly.
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("installing the SIGTERM handler")?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
     tokio::signal::ctrl_c()
         .await
         .context("waiting for Ctrl-C")?;

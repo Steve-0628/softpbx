@@ -1275,6 +1275,30 @@ fn regression_100_trying_is_not_forwarded() {
     );
 }
 
+/// An INVITE without a Contact is refused (RFC 3261 §8.1.1.8): we would have
+/// nowhere to send the BYE.
+#[test]
+fn golden_invite_without_contact_is_400() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let invite = "INVITE sip:1002@192.0.2.10 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-golden-nc\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:1001@192.0.2.10>;tag=from1\r\n\
+         To: <sip:1002@192.0.2.10>\r\n\
+         Call-ID: golden-nc\r\n\
+         CSeq: 1 INVITE\r\n\
+         Content-Length: 0\r\n\r\n";
+    let outputs = feed(&mut world, &mut switch, invite.as_bytes());
+    assert_eq!(
+        response_of(&outputs, 400).status,
+        400,
+        "no Contact, no call: {outputs:?}"
+    );
+    assert_eq!(switch.active_calls(), 0);
+}
+
 // ----- helpers for the regressions ------------------------------------------
 
 fn phones() -> Vec<Device> {
