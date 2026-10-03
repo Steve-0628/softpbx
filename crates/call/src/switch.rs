@@ -38,6 +38,9 @@ pub struct TrunkConfig {
     pub name: String,
     /// Where its SIP messages come from, and where we send ours.
     pub peer: SocketAddr,
+    /// Digest credentials, for peers that challenge our INVITEs (RFC 2617).
+    pub username: Option<String>,
+    pub secret: Option<String>,
 }
 
 /// Everything the switch needs to know from the config file.
@@ -139,6 +142,10 @@ struct CallCtx {
     callee_tx: Option<ClientTransaction>,
     callee_invite: Option<Request>,
     callee_dialog: Option<Dialog>,
+    /// Which trunk the callee leg is on, if any.
+    callee_trunk: Option<String>,
+    /// Whether we already retried the INVITE with credentials.
+    auth_retried: bool,
     /// Our ACK for the callee's 2xx; re-sent if they retransmit it.
     callee_ack: Option<Request>,
     /// Server transactions for in-dialog requests we received (BYE, re-INVITE).
@@ -439,6 +446,40 @@ impl Switch {
         let from_trunk = from
             .map(|address| self.is_trunk_peer(address))
             .unwrap_or(false);
+        // A trunk caller may be anyone — but not *us*: an INVITE from a trunk
+        // whose From claims one of our numbers in our own domain is
+        // impersonation (docs/02 §6). The far side's own labels (its trunk
+        // login in its own domain) are fine.
+        if from_trunk {
+            let from_host = header(&request.headers, "from")
+                .map(uri_of)
+                .and_then(|uri| uri.rsplit('@').next())
+                .unwrap_or("");
+            let our_host = self
+                .config
+                .pbx_uri
+                .strip_prefix("sip:")
+                .unwrap_or(&self.config.pbx_uri);
+            if from_host == our_host
+                && self
+                    .config
+                    .devices
+                    .iter()
+                    .any(|device| device.number == caller_number)
+            {
+                let response = tagged(make_response(&request, 403, "Forbidden"), &self.fresh_tag());
+                let actions = caller_tx.on_response_from_user(response, now_ms);
+                push_sends(&mut outputs, actions);
+                outputs.push(Output::CallLog(call_log_line(
+                    &caller_number,
+                    &dialed,
+                    now_ms,
+                    now_ms,
+                    "impersonation",
+                )));
+                return outputs;
+            }
+        }
         if !from_trunk && !self.registrar.is_registered(&caller_number, now_ms) {
             let response = tagged(make_response(&request, 403, "Forbidden"), &self.fresh_tag());
             let actions = caller_tx.on_response_from_user(response, now_ms);
@@ -461,6 +502,7 @@ impl Switch {
             .strip_prefix("sip:")
             .unwrap_or(&self.config.pbx_uri)
             .to_string();
+        let mut callee_trunk: Option<String> = None;
         let (callee_number, callee_contact, callee_domain) =
             match route(&self.config.routing, &dialed) {
                 Destination::Reject => {
@@ -501,6 +543,32 @@ impl Switch {
                 Destination::Trunk(name, number) => {
                     // Down the trunk: the peer routes the number itself, and
                     // the number lives in the peer's domain (docs/06 §1).
+                    //
+                    // Loop guard: a call that arrived *from* a trunk never
+                    // goes back to the same one (overlapping number ranges
+                    // between two PBXs would otherwise ping-pong forever).
+                    if from
+                        .map(|address| {
+                            self.config
+                                .trunks
+                                .iter()
+                                .any(|trunk| trunk.name == name && trunk.peer == address)
+                        })
+                        .unwrap_or(false)
+                    {
+                        let response =
+                            tagged(make_response(&request, 403, "Forbidden"), &self.fresh_tag());
+                        let actions = caller_tx.on_response_from_user(response, now_ms);
+                        push_sends(&mut outputs, actions);
+                        outputs.push(Output::CallLog(call_log_line(
+                            &caller_number,
+                            &number,
+                            now_ms,
+                            now_ms,
+                            "routing-loop",
+                        )));
+                        return outputs;
+                    }
                     let Some(trunk) = self.config.trunks.iter().find(|trunk| trunk.name == name)
                     else {
                         let response = tagged(
@@ -518,9 +586,10 @@ impl Switch {
                         )));
                         return outputs;
                     };
+                    callee_trunk = Some(trunk.name.clone());
                     (
                         number.clone(),
-                        format!("sip:{number}@{}", trunk.peer.ip()),
+                        format!("sip:{number}@{}", trunk.peer),
                         trunk.peer.ip().to_string(),
                     )
                 }
@@ -632,9 +701,10 @@ impl Switch {
         let (callee_tx, actions) = ClientTransaction::new(callee_invite.clone(), now_ms);
         push_sends(&mut outputs, actions);
 
+        let caller_to_uri = header(&request.headers, "to").map(uri_of).unwrap_or("");
         let caller_dialog = Dialog::new(
             &caller_call_id,
-            &callee_aor, // our side is the address of record being called
+            caller_to_uri, // §12.2.1.1: our side is the request's To URI
             &our_caller_tag,
             &caller_uri,
             &caller_tag,
@@ -671,6 +741,8 @@ impl Switch {
                 callee_tx: Some(callee_tx),
                 callee_invite: Some(callee_invite),
                 callee_dialog: Some(callee_dialog),
+                callee_trunk,
+                auth_retried: false,
                 callee_ack: None,
                 server_txs: Vec::new(),
                 client_txs: Vec::new(),
@@ -716,6 +788,25 @@ impl Switch {
             });
             (dialog.local_tag.clone(), port)
         };
+
+        // A re-INVITE that moves media moves our relay target with it
+        // (RFC 3264); a declined stream (port 0 / c=0.0.0.0) stops it.
+        if !request.body.is_empty() {
+            let moved = media_target(&request.body);
+            let declined = media_declined(&request.body);
+            if moved.is_some() || declined {
+                if let Some(call) = self.calls.get_mut(&id) {
+                    if let Some(media) = call.media.as_mut() {
+                        let leg = match leg {
+                            Leg::Caller => &mut media.caller,
+                            Leg::Callee => &mut media.callee,
+                        };
+                        leg.peer_addr = moved.unwrap_or_default();
+                        leg.learned = None;
+                    }
+                }
+            }
+        }
 
         let mut response = tagged(make_response(&request, 200, "OK"), &our_tag);
         if !request.body.is_empty() {
@@ -1014,6 +1105,14 @@ impl Switch {
                     if response.status == 100 {
                         continue; // hop-by-hop; never shown to the caller
                     }
+                    // A peer that challenges our INVITE gets a credentialed
+                    // retry (RFC 2617) — trunk authentication, not a failure.
+                    if matches!(response.status, 401 | 407) {
+                        if let Some(outputs2) = self.trunk_auth_retry(id, &response, now_ms) {
+                            outputs.extend(outputs2);
+                            continue;
+                        }
+                    }
                     let event = if response.status < 200 {
                         CallEvent::CalleeProgress(response.status)
                     } else if response.status < 300 {
@@ -1073,6 +1172,58 @@ impl Switch {
             }
         }
         outputs
+    }
+
+    /// Retries the callee-leg INVITE with digest credentials when a trunk
+    /// peer challenges it. Returns `None` when this is not that situation.
+    fn trunk_auth_retry(
+        &mut self,
+        id: &u64,
+        response: &Response,
+        now_ms: u64,
+    ) -> Option<Vec<Output>> {
+        let challenge = header(&response.headers, "www-authenticate")?;
+        let call = self.calls.get(id)?;
+        if call.auth_retried || !matches!(call.state, CallState::Offering | CallState::Ringing) {
+            return None;
+        }
+        let trunk_name = call.callee_trunk.clone()?;
+        let invite = call.callee_invite.clone()?;
+        let (username, secret) = {
+            let trunk = self.config.trunks.iter().find(|t| t.name == trunk_name)?;
+            (trunk.username.clone()?, trunk.secret.clone()?)
+        };
+        let challenge = sip_stack::digest::parse_challenge(challenge)?;
+        let mut retry = invite;
+        // A retry is a new transaction: fresh Via branch, next CSeq.
+        let cseq = header(&retry.headers, "cseq")
+            .and_then(|cseq| cseq.split_whitespace().next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(1)
+            + 1;
+        for entry in &mut retry.headers {
+            match canonical_header(&entry.name).as_str() {
+                "via" => entry.value = self.via("invite"),
+                "cseq" => entry.value = format!("{cseq} INVITE"),
+                _ => {}
+            }
+        }
+        let value = sip_stack::digest::authorization_value(
+            &challenge, &username, &secret, "INVITE", &retry.uri,
+        );
+        retry.headers.push(Header {
+            name: "Authorization".to_string(),
+            value,
+        });
+        let (transaction, actions) = ClientTransaction::new(retry.clone(), now_ms);
+        if let Some(call) = self.calls.get_mut(id) {
+            call.auth_retried = true;
+            call.callee_invite = Some(retry);
+            call.callee_tx = Some(transaction);
+        }
+        let mut outputs = Vec::new();
+        push_sends(&mut outputs, actions);
+        Some(outputs)
     }
 
     /// Runs one call event through the state machine, expanding the commands
@@ -1145,6 +1296,13 @@ impl Switch {
                 call.caller_tx.on_response_from_user(response, now_ms)
             }
             Command::FailCaller(status) => {
+                // Never relay a challenge-less 401/407 toward the caller:
+                // the challenge died with the callee leg. Say what it meant.
+                let status = if matches!(status, 401 | 407) {
+                    503
+                } else {
+                    status
+                };
                 let response = tagged(
                     make_response(&call.caller_invite, status, reason_phrase(status)),
                     &call.caller_dialog.local_tag.clone(),
@@ -1405,6 +1563,24 @@ fn unsupported_require(request: &Request) -> Vec<String> {
     tags
 }
 
+/// Whether an SDP body declines its media (RFC 3264: `m=audio 0` or
+/// `c=0.0.0.0`).
+fn media_declined(body: &[u8]) -> bool {
+    let Ok(sdp) = parse_sdp(body) else {
+        return false;
+    };
+    sdp.media
+        .iter()
+        .any(|media| media.media == "audio" && media.port == 0)
+        || sdp.media.iter().any(|media| {
+            media
+                .connection
+                .as_deref()
+                .map(|address| address == "0.0.0.0")
+                .unwrap_or(false)
+        })
+}
+
 /// Payload type numbers an SDP body offers, for codec intersection.
 fn sdp_payload_types(body: &[u8]) -> Vec<u8> {
     parse_sdp(body)
@@ -1517,7 +1693,9 @@ fn reason_phrase(status: u16) -> &'static str {
         180 => "Ringing",
         183 => "Session Progress",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
+        407 => "Proxy Authentication Required",
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",

@@ -113,6 +113,12 @@ unmapped number, ACKed and torn down cleanly).
 
 ## 7. Interop matrix (living document)
 
+Admission paths, for honesty: the rows below went through MikoPBX's
+*registration-mode trunk* (it registers to us as a device) — the registrar
+path. The phase-9 `[[trunk]]`/`trunk:` paths (address-based admission,
+digest retry, loop guard) are **simulation-tested only** so far; they get
+their live rows when the reverse direction (softpbx → MikoPBX) goes up.
+
 | Behavior | MikoPBX ↔ softpbx | Notes |
 | --- | --- | --- |
 | MikoPBX registers to softpbx (trunk as 1001) | ✅ | re-registers every ~60 s; qop-less digest accepted |
@@ -127,4 +133,8 @@ unmapped number, ACKed and torn down cleanly).
 
 The phase-7 soak completed: **3000/3000 calls** (300 loops × 10 concurrent,
 real-socket fake phones, reused identities) — every loop 10/10, every call
-logged `completed`, no stuck calls, no leaked media ports, zero parser noise.
+logged `completed`. Measured: per-call completion (3000 `completed` lines in
+the call log). Observed but not asserted by the tooling: no stuck calls, no
+leaked media ports, zero parser noise. The tools (`stress.py`, `round2.sh`)
+live in `/tmp/opencode/softpbx/` — the repo keeps only tests; move them in if
+they earn it.

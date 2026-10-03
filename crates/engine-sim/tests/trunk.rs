@@ -46,6 +46,8 @@ fn switch() -> Switch {
         trunks: vec![TrunkConfig {
             name: "mikopbx".to_string(),
             peer: peer_addr(),
+            username: None,
+            secret: None,
         }],
         devices: vec![
             Device {
@@ -197,8 +199,8 @@ fn trunk_outbound_call_is_addressed_to_the_peer() {
     // It goes to the peer's address (asserted by the daemon's dispatch; here
     // the important part is the addressing on the wire).
     assert_eq!(
-        invite.uri, "sip:3001@192.168.77.108",
-        "peer routes the number"
+        invite.uri, "sip:3001@192.168.77.108:5060",
+        "peer routes the number, at its configured port"
     );
     let to = header_value(&invite.headers, "to").unwrap();
     assert!(
@@ -403,7 +405,7 @@ fn trunk_inbound_bye_from_peer_ends_the_call() {
 // ----- resilience -----------------------------------------------------------
 
 #[test]
-fn trunk_lost_200_is_recovered_by_retransmission() {
+fn trunk_duplicate_200_is_reacked() {
     let mut world = World::with_seed(0x5EED);
     let mut switch = switch();
     register_device(&mut world, &mut switch, "1001", "change-me");
@@ -421,7 +423,7 @@ fn trunk_lost_200_is_recovered_by_retransmission() {
         &sdp_body("192.168.77.108:10000"),
     );
 
-    // First 200 is lost on the wire; the peer retransmits it later.
+    // The peer retransmits its 200 (our ACK may have been lost).
     let outputs = feed(&mut world, &mut switch, &ok);
     assert_eq!(requests_of(&outputs, Method::Ack).len(), 1);
     let again = feed(&mut world, &mut switch, &ok);
@@ -466,6 +468,349 @@ fn trunk_no_answer_times_out_with_408() {
     }
     assert!(got_408, "the caller is told it timed out");
     assert_eq!(switch.active_calls(), 0);
+}
+
+// ----- review findings (boundary review of the trunk core) ------------------
+
+/// A peer that challenges our INVITE gets a credentialed retry (RFC 2617) —
+/// trunk authentication is not a call failure.
+#[test]
+fn trunk_peer_challenge_is_answered_with_credentials() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = Switch::new(SwitchConfig {
+        trunks: vec![TrunkConfig {
+            name: "mikopbx".to_string(),
+            peer: peer_addr(),
+            username: Some("trunkuser".to_string()),
+            secret: Some("trunkpass".to_string()),
+        }],
+        ..switch_config_base()
+    });
+    register_device(&mut world, &mut switch, "1001", "change-me");
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite("1001", "3001", "trunk-auth", "192.0.2.1:10000"),
+    );
+    let first = requests_of(&outputs, Method::Invite)[0].clone();
+
+    // The peer says 401 with a qop=auth challenge (like MikoPBX does).
+    let mut challenge = make_response(&first, 401, "Unauthorized");
+    challenge.headers.push(Header {
+        name: "WWW-Authenticate".to_string(),
+        value: "Digest realm=\"asterisk\", nonce=\"abc\", algorithm=MD5, qop=\"auth\"".to_string(),
+    });
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &serialize_message(&Message::Response(challenge)),
+    );
+
+    // We retry with credentials — the call is not torn down.
+    let retried = requests_of(&outputs, Method::Invite);
+    assert_eq!(retried.len(), 1, "one credentialed retry: {outputs:?}");
+    let auth = header_value(&retried[0].headers, "Authorization").expect("Authorization");
+    assert!(auth.contains("username=\"trunkuser\""), "{auth}");
+    assert!(auth.contains("qop=auth"), "{auth}");
+    assert_eq!(switch.active_calls(), 1, "the call survives the challenge");
+
+    // The peer accepts; the call goes up normally.
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(
+            &retried[0],
+            200,
+            "OK",
+            "far1",
+            &sdp_body("192.168.77.108:10000"),
+        ),
+    );
+    assert_eq!(requests_of(&outputs, Method::Ack).len(), 1);
+    assert_eq!(response_of(&outputs, 200).status, 200);
+}
+
+/// When authentication fails, the caller hears 503 — never a naked 401
+/// (the challenge died with the callee leg).
+#[test]
+fn trunk_auth_failure_maps_to_503() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = Switch::new(SwitchConfig {
+        trunks: vec![TrunkConfig {
+            name: "mikopbx".to_string(),
+            peer: peer_addr(),
+            username: Some("trunkuser".to_string()),
+            secret: Some("wrongpass".to_string()),
+        }],
+        ..switch_config_base()
+    });
+    register_device(&mut world, &mut switch, "1001", "change-me");
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite("1001", "3001", "trunk-badauth", "192.0.2.1:10000"),
+    );
+    let first = requests_of(&outputs, Method::Invite)[0].clone();
+    let challenge = |nonce: &str| {
+        let mut response = make_response(&first, 401, "Unauthorized");
+        response.headers.push(Header {
+            name: "WWW-Authenticate".to_string(),
+            value: format!("Digest realm=\"asterisk\", nonce=\"{nonce}\", algorithm=MD5"),
+        });
+        serialize_message(&Message::Response(response))
+    };
+    let outputs = feed(&mut world, &mut switch, &challenge("n1"));
+    let retried = requests_of(&outputs, Method::Invite)[0].clone();
+    // The peer rejects the *retry* (its own Via); no further retries.
+    let mut second = make_response(&retried, 401, "Unauthorized");
+    second.headers.push(Header {
+        name: "WWW-Authenticate".to_string(),
+        value: "Digest realm=\"asterisk\", nonce=\"n2\", algorithm=MD5".to_string(),
+    });
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &serialize_message(&Message::Response(second)),
+    );
+    assert!(
+        requests_of(&outputs, Method::Invite).is_empty(),
+        "one retry only"
+    );
+    assert_eq!(
+        response_of(&outputs, 503).status,
+        503,
+        "the caller hears 503: {outputs:?}"
+    );
+}
+
+/// A trunk caller may be anyone — but not one of our own numbers in our own
+/// domain (impersonation).
+#[test]
+fn trunk_cannot_impersonate_local_devices() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_device(&mut world, &mut switch, "1002", "bob-secret");
+    let mut forged = peer_invite("3001", "1002", "trunk-forged");
+    // Rewrite the From to claim to be our own device 1001.
+    let text = String::from_utf8(forged.clone()).unwrap();
+    let text = text.replace(
+        "From: <sip:3001@192.168.77.108>;tag=far1",
+        "From: <sip:1001@192.0.2.10>;tag=far1",
+    );
+    forged = text.into_bytes();
+    let outputs = feed_from(&mut world, &mut switch, &forged, Some(peer_addr()));
+    assert_eq!(response_of(&outputs, 403).status, 403, "{outputs:?}");
+    let logs = call_logs(&outputs);
+    assert!(
+        logs[0].contains("\"result\":\"impersonation\""),
+        "{}",
+        logs[0]
+    );
+    assert!(requests_of(&outputs, Method::Invite).is_empty());
+}
+
+/// A call that arrives from a trunk never routes back to the same trunk.
+#[test]
+fn trunk_loop_is_refused() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_device(&mut world, &mut switch, "1002", "bob-secret");
+    // 3001 calls 3xxx — which routes right back out the same trunk.
+    let outputs = feed_from(
+        &mut world,
+        &mut switch,
+        &peer_invite("3001", "3002", "trunk-loop"),
+        Some(peer_addr()),
+    );
+    assert_eq!(response_of(&outputs, 403).status, 403, "{outputs:?}");
+    let logs = call_logs(&outputs);
+    assert!(
+        logs[0].contains("\"result\":\"routing-loop\""),
+        "{}",
+        logs[0]
+    );
+    assert!(requests_of(&outputs, Method::Invite).is_empty());
+}
+
+/// The peer's port is part of where we send (not silently 5060).
+#[test]
+fn trunk_peer_port_is_honored() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = Switch::new(SwitchConfig {
+        trunks: vec![TrunkConfig {
+            name: "mikopbx".to_string(),
+            peer: "192.168.77.108:5061".parse().expect("peer"),
+            username: None,
+            secret: None,
+        }],
+        ..switch_config_base()
+    });
+    register_device(&mut world, &mut switch, "1001", "change-me");
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite("1001", "3001", "trunk-port", "192.0.2.1:10000"),
+    );
+    let toward_peer = requests_of(&outputs, Method::Invite);
+    assert_eq!(
+        toward_peer[0].uri, "sip:3001@192.168.77.108:5061",
+        "the configured port is used"
+    );
+}
+
+/// CANCEL toward a trunk: same transaction shape the peer expects.
+#[test]
+fn trunk_cancel_toward_peer() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_device(&mut world, &mut switch, "1001", "change-me");
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite("1001", "3001", "trunk-cancel", "192.0.2.1:10000"),
+    );
+    let invite = requests_of(&outputs, Method::Invite)[0].clone();
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(&invite, 180, "Ringing", "far1", b""),
+    );
+    let ringing = response_of(&outputs, 180);
+    let cancel = format!(
+        "CANCEL sip:3001@192.168.77.108 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-trunk-cancel\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:1001@192.0.2.10>;tag=from1\r\n\
+         To: <sip:3001@192.168.77.108>;tag={}\r\n\
+         Call-ID: trunk-cancel\r\n\
+         CSeq: 1 CANCEL\r\n\
+         Content-Length: 0\r\n\r\n",
+        tag_of(header_value(&ringing.headers, "to").unwrap()).unwrap()
+    );
+    let outputs = feed(&mut world, &mut switch, cancel.as_bytes());
+    assert_eq!(
+        response_of(&outputs, 200).status,
+        200,
+        "CANCEL acknowledged"
+    );
+    assert_eq!(response_of(&outputs, 487).status, 487, "our INVITE dies");
+    let cancels = requests_of(&outputs, Method::Cancel);
+    assert_eq!(cancels.len(), 1, "CANCEL toward the peer: {outputs:?}");
+    assert_eq!(
+        header_value(&cancels[0].headers, "cseq").unwrap(),
+        "1 CANCEL",
+        "same CSeq number as the INVITE"
+    );
+}
+
+/// A re-INVITE that moves media moves our relay target with it.
+#[test]
+fn trunk_reinvite_moves_the_relay_target() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_device(&mut world, &mut switch, "1001", "change-me");
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite("1001", "3001", "trunk-move", "192.0.2.1:10000"),
+    );
+    let invite = requests_of(&outputs, Method::Invite)[0].clone();
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(
+            &invite,
+            200,
+            "OK",
+            "far1",
+            &sdp_body("192.168.77.108:10000"),
+        ),
+    );
+    let _ = response_of(&outputs, 200);
+    // The callee leg's tag toward the peer is the From tag of our INVITE.
+    let our_tag = tag_of(header_value(&invite.headers, "from").unwrap())
+        .expect("our callee tag")
+        .to_string();
+
+    // The peer moves its media. (Note the Call-ID: the peer speaks on the
+    // callee leg, whose Call-ID is the one from our INVITE.)
+    let callee_call_id = header_value(&invite.headers, "call-id").unwrap();
+    let refresh = format!(
+        "INVITE {PBX_URI} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 192.168.77.108:5060;branch=z9hG4bK-move\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:3001@192.168.77.108>;tag=far1\r\n\
+         To: <sip:1001@192.0.2.10>;tag={}\r\n\
+         Call-ID: {}\r\n\
+         CSeq: 5 INVITE\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: {}\r\n\r\n{}",
+        our_tag,
+        callee_call_id,
+        sdp_body("192.168.77.200:30000").len(),
+        String::from_utf8(sdp_body("192.168.77.200:30000")).unwrap()
+    );
+    let outputs = feed_from(
+        &mut world,
+        &mut switch,
+        refresh.as_bytes(),
+        Some(peer_addr()),
+    );
+    assert_eq!(response_of(&outputs, 200).status, 200, "{outputs:?}");
+
+    // Caller media now flows to the new address, not the old one.
+    let packet = rtp_packet();
+    let forwarded = switch.on_rtp(10_000, "192.0.2.1:10000", &packet);
+    let to = match &forwarded[..] {
+        [Output::SendRtp { to, .. }] => to.clone(),
+        other => panic!("expected forwarding, got {other:?}"),
+    };
+    assert_eq!(to, "192.168.77.200:30000", "relay target follows the media");
+}
+
+fn rtp_packet() -> Vec<u8> {
+    let mut packet = vec![
+        0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    ];
+    packet.extend_from_slice(&[0xff; 80]);
+    packet
+}
+
+fn switch_config_base() -> SwitchConfig {
+    SwitchConfig {
+        realm: REALM.to_string(),
+        pbx_uri: PBX_URI.to_string(),
+        pbx_host: PBX_HOST.to_string(),
+        pbx_contact: "<sip:192.0.2.10:5060>".to_string(),
+        rtp_host: "192.0.2.10".to_string(),
+        rtp_port_base: 10_000,
+        rtp_ports: 100,
+        routing: vec![
+            Rule {
+                pattern: "3*".to_string(),
+                action: Action::Trunk("mikopbx".to_string()),
+                strip: None,
+            },
+            Rule {
+                pattern: "0".to_string(),
+                action: Action::Number("1002".to_string()),
+                strip: None,
+            },
+        ],
+        trunks: vec![],
+        devices: vec![
+            Device {
+                number: "1001".to_string(),
+                name: "Alice".to_string(),
+                secret: "change-me".to_string(),
+            },
+            Device {
+                number: "1002".to_string(),
+                name: "Bob".to_string(),
+                secret: "bob-secret".to_string(),
+            },
+        ],
+    }
 }
 
 // ----- message builders -----------------------------------------------------

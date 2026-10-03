@@ -33,8 +33,14 @@ pub struct FileConfig {
 pub struct TrunkCfg {
     /// Label used in `to = "trunk:<name>"` routing rules and in logs.
     pub name: String,
-    /// Its address, "ip:port" (usually 5060).
+    /// Its address, "ip:port".
     pub peer: String,
+    /// Digest credentials, for peers that challenge our INVITEs. Both fields
+    /// or neither.
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 /// One `[[routing]]` rule: `match` a dialed number, `to` a destination.
@@ -204,6 +210,9 @@ impl FileConfig {
                 .peer
                 .parse::<std::net::SocketAddr>()
                 .with_context(|| format!("trunk \"{}\": peer must be ip:port", trunk.name))?;
+            if trunk.username.is_some() != trunk.secret.is_some() {
+                bail!("trunk \"{}\": username and secret go together", trunk.name);
+            }
         }
         let mut numbers = HashSet::new();
         for device in &self.device {
@@ -246,6 +255,8 @@ impl FileConfig {
                 .map(|trunk| call::TrunkConfig {
                     name: trunk.name.clone(),
                     peer: trunk.peer.parse().expect("validated"),
+                    username: trunk.username.clone(),
+                    secret: trunk.secret.clone(),
                 })
                 .collect(),
             devices: self

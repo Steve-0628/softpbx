@@ -127,10 +127,12 @@ The system runs on a trusted office network or VPN. What we still do:
   surface reduction.
 
 What we deliberately do **not** do: verify that an INVITE's `From` really is
-who it claims (any registered device can present any caller ID — phones do
-this anyway for legitimate reasons), challenge INVITEs themselves, or track
-devices by network address. On a hostile network none of this is enough; that
-is what the "trusted network" premise means.
+who it claims. Any *host* can present any caller ID (phones do this anyway for
+legitimate reasons), and we do not check that the caller's INVITE comes from
+the address it registered from. The one exception: trunk peers may not present
+*our own* numbers in our own domain — that is impersonation and gets `403`.
+On a hostile network none of this is enough; that is what the "trusted
+network" premise means.
 
 We explicitly do not implement TLS, SRTP, intrusion detection, or rate limiting
 beyond basic sanity limits.
