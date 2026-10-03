@@ -3,21 +3,11 @@
 version = 4
 
 [[package]]
-name = "api"
-version = "0.1.0"
-dependencies = [
- "call",
- "store",
-]
-
-[[package]]
 name = "call"
 version = "0.1.0"
 dependencies = [
  "media",
  "sip-stack",
- "store",
- "vbd",
 ]
 
 [[package]]
@@ -28,23 +18,6 @@ dependencies = [
  "media",
  "rtp",
  "sip-stack",
- "store",
- "t38",
-]
-
-[[package]]
-name = "faxserver"
-version = "0.1.0"
-dependencies = [
- "store",
- "t38",
-]
-
-[[package]]
-name = "line-gw"
-version = "0.1.0"
-dependencies = [
- "sip-syntax",
 ]
 
 [[package]]
@@ -55,21 +28,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "pbx-cli"
-version = "0.1.0"
-dependencies = [
- "store",
-]
-
-[[package]]
 name = "pbx-daemon"
 version = "0.1.0"
 dependencies = [
- "api",
  "call",
- "media",
  "sip-stack",
- "store",
 ]
 
 [[package]]
@@ -86,22 +49,3 @@ dependencies = [
 [[package]]
 name = "sip-syntax"
 version = "0.1.0"
-
-[[package]]
-name = "store"
-version = "0.1.0"
-
-[[package]]
-name = "t38"
-version = "0.1.0"
-dependencies = [
- "sip-syntax",
-]
-
-[[package]]
-name = "vbd"
-version = "0.1.0"
-dependencies = [
- "media",
- "rtp",
-]

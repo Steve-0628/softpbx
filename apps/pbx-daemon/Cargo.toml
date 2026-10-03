@@ -8,6 +8,3 @@ publish.workspace = true
 [dependencies]
 call = { path = "../../crates/call" }
 sip-stack = { path = "../../crates/sip-stack" }
-media = { path = "../../crates/media" }
-store = { path = "../../crates/store" }
-api = { path = "../../crates/api" }

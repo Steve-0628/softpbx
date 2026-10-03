@@ -1,151 +1,144 @@
-# 02. 全体アーキテクチャ
+# 02. Architecture
 
-## 1. 設計の要点
+## 1. The shape of the program
 
-1. **B2BUA（Back-to-Back User Agent）モデル。** SIP プロキシではない。
-   通話ごとに両側のダイアログとメディア路を独立に保持し、中継・処理する。
-   転送・保留・コーデック変換・FAX/モデムのモード切替・相手 PBX との相互接続が
-   すべて同じモデルで扱える。
-2. **シグナリングとメディアのスレッドを物理的に分離する。** 呼制御の遅延と
-   音声のリアルタイム性を切り離す（§3）。
-3. **設定は宣言的 Desired State。** 実行中の設定ファイルを直接書き換えない。
-   実行時状態は Desired State から導出する（§5）。
-4. **保存はファイルベース。DB エンジンは使わない**（§5）。
-5. **すべての状態遷移は明示的な FSM。** 通話・FAX・モデム・プロトコルを
-   `enum` + 遷移表で書き、テスト可能にする。
-6. **互換性クイークは表データ。** 標準準拠コードに例外分岐を散らさない。
-
-## 2. 平面分割
+One process (`pbx-daemon`), one async runtime (tokio), one config file read at
+startup. No databases, no background management services, no shared-nothing
+clusters.
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│ UI (Web / TypeScript)            ← ただのクライアント      │
-├──────────────────────────────────────────────────────────┤
-│ API  REST / WebSocket / gRPC      認証・権限・監査ログ      │
-├──────────────────────────────────────────────────────────┤
-│ 制御面 (tokio, async)                                     │
-│  ├ call/        コール FSM、ルーティング、通話機能          │
-│  ├ sip-stack/   トランザクション・ダイアログ・トランク制御   │
-│  ├ faxserver/   FAX 受発信・PDF 化・メール送信              │
-│  └ store/       Desired State、通話ログ、監査ログ           │
-├──────────────────────────────────────────────────────────┤
-│ 境界: lock-free SPSC ring buffer（イベント/コマンド）       │
-├──────────────────────────────────────────────────────────┤
-│ メディア面 (専用スレッド、コア固定、リアルタイム)            │
-│  ├ rtp/      RTP/RTCP、DTMF、ジッタバッファ                │
-│  ├ media/    コーデック、ミキサ、エコー除去、DSP            │
-│  ├ vbd/      FAX/モデム検出とモード遷移                     │
-│  └ t38/      T.38 ゲートウェイ（T.30 ↔ UDPTL）             │
-├──────────────────────────────────────────────────────────┤
-│ 端末・回線境界                                            │
-│  ├ SIP 端末（IP 電話機・ソフトフォン）                      │
-│  ├ アナログ端末 → 外付けゲートウェイ（NVR500/510 級）SIP 経由│
-│  └ 拠点間 → MikoPBX 互換 SIP トランク                      │
-└──────────────────────────────────────────────────────────┘
+        UDP :5060                    UDP (RTP port range)
+ phones ────────► ┌─────────────────────────────────────┐ ────► phones
+                  │  pbx-daemon                         │
+                  │                                     │
+                  │  sip-stack   transactions, dialogs  │
+                  │  call        call logic, routing    │
+                  │  rtp         audio forwarding       │
+                  │                                     │
+                  │  state in memory:                   │
+                  │   registrations, ongoing calls      │
+                  └─────────────────────────────────────┘
+                              │
+                              ▼
+                  logs (stdout) + call log (file, append-only)
 ```
 
-## 3. プロセス / スレッドモデル
+## 2. Crates
 
-単一デーモン `pbx-daemon` を基本とし、内部で次の実行単位を持つ。
-
-| 実行単位 | 実装 | 責務 |
-| --- | --- | --- |
-| signaling | tokio マルチスレッド（async） | SIP 受送信、トランザクション、ダイアログ、呼制御 FSM、API |
-| media | N 本の専用スレッド（コア固定、`SCHED_FIFO`） | RTP 送受信、DSP、T.38、VBD モード管理 |
-| io | 専用タスク | ファイル書き込み（ログ・設定）のバッチ処理 |
-| provision | 専用タスク | 電話機/ゲートウェイへの設定配信、応答監視 |
-
-- **オーディオパスでメモリ確保・ロック・ログ出力・ファイル I/O をしない。**
-  バッファは起動時にプリアロケートし、スラブ/固定長リングで受け渡す。
-- コールは `call_id` のハッシュでメディアスレッドへ**シャーディング**し、
-  1 通話の処理は常に同じスレッドで完結する（共有ロック不要）。
-- 制御面とメディア面の通信は **SPSC リングバッファ**（イベントは上向き、
-  コマンドは下向き）。`Arc<Mutex<>>` で全体状態を握らない。
-- **制御面が停止しても確立済み通話の音声は止まらない。** メディア面は
-  呼制御から独立して動作し、接続終了イベントのみを待つ。
-
-## 4. コール処理の骨格
-
-```
-SIP メッセージ → sip-stack (トランザクション/ダイアログ)
-                     │ イベント
-                 call::Fsm (B2BUA)
-                     │ コマンド
-        ┌────────────┼─────────────┐
-   media::Fsm    sip-stack      store::log
-   (RTP/T.38)    (re-INVITE 等)  (通話ログ)
-```
-
-- 通話 FSM の状態例：`Idle → Offering → Proceeding → Ringing → Answered`
-  `→ Held / Transferring / Conferencing → Terminating → Terminated`
-- すべての状態遷移は**純粋関数** `fn transit(state, event) -> (state, Vec<Command>)`
-  として書く。副作用はコマンド実行側に追い出す。
-  → この形にすると決定的シミュレーションテストとプロパティテストが効く。
-- FAX/モデムは FSM の派生：`Answered → (検出) → VbdFax / VbdModem → …`
-
-## 5. データと永続化（DB エンジン不使用）
-
-**SQLite / RDBMS は使わない。** 要件は「設定 100 件程度、通話ログは追記型、
-単一サーバ」であり、DB サーバやスキーマ管理を持ち込む運用負荷が見合わない。
-ファイルベースで十分に成立し、**バックアップはディレクトリをコピーするだけ**になる。
-
-```
-/var/lib/softpbx/
-├── config/
-│   ├── desired/     # 宣言的設定（TOML、1 エンティティ 1 ファイル）
-│   ├── history/     # 変更履歴（スナップショット + 変更理由、ロールバック用）
-│   └── compiled/    # Desired State から生成した実行時状態（再生成可能、追跡不要）
-├── log/
-│   ├── call/        # 発着信ログ（NDJSON、追記のみ、日付ローテーション）
-│   ├── audit/       # 監査ログ（NDJSON、追記のみ）
-│   └── app/         # 構造化ログ
-├── fax/
-│   ├── spool/       # 送信/再送キュー
-│   ├── inbox/       # 受信イメージ（TIFF/PDF）
-│   └── outbox/      # 送信元
-└── state/           # 揮発的状態（再起動で再構築可能）
-```
-
-### ルール
-
-| ルール | 内容 |
+| Crate | Responsibility |
 | --- | --- |
-| 信頼の単一源 | `config/desired/` のみが正。`compiled/` はいつでも再生成できる |
-| 原子的書き込み | 一時ファイルに書いて `rename()`（同一ファイルシステム内で原子的）。必要に応じ `fsync` |
-| 追記のみ | ログは書き換え・削除しない。ローテーションはファイルを閉じて新規作成 |
-| 単一ライター | デーモン内の `store` タスクだけが書き込む。プロセス跨ぎの排他制御は不要 |
-| 読み取り | 起動時にメモリへロードし、`inotify` 等で外部変更を検知 |
-| 拡張点 | `Store` トレイトで抽象化。将来スケールが必要なら `redb` や PostgreSQL 実装へ差し替え可能 |
+| `sip-syntax` | Parse and serialize SIP messages and SDP. Pure functions, no I/O, no dependencies. Malformed input must produce an error, never a panic. |
+| `sip-stack` | UDP transport, SIP transactions (request/response matching, retransmission), dialogs (a call's signaling session). |
+| `call` | The actual PBX logic: who is registered, what a dialed number means, what happens when someone answers or hangs up. Each call is a small state machine. |
+| `rtp` | RTP packet parsing and forwarding between the two sides of a call. Small jitter buffer for audio smoothness. |
+| `media` | G.711 handling; later, audio mixing if any feature needs it. |
+| `engine-sim` | The deterministic simulation test bed (docs/04). |
 
-## 6. API と管理系
+Dependency rule: `sip-syntax` depends on nothing. `call` may use `sip-stack`
+and `rtp`. Nothing depends on `engine-sim`.
 
-- REST（設定・照会・操作）+ WebSocket（イベント通知：着信、通話状態、FAX 結果）
-- 認証は API キー + ログインセッション、権限はロール（管理者/運用/閲覧）
-- 変更系 API はすべて**監査ログ**に記録（誰が・いつ・何を）
-- UI は API クライアントの一つ。OpenAPI 定義から TS クライアントを生成する
+## 3. Concurrency and state
 
-## 7. クレート依存関係
+- tokio tasks: one for the SIP socket, one per call (both signaling and audio
+  forwarding for that call), one for logging.
+- Shared state is small and coarse: a table of registered devices and a table
+  of active calls, behind ordinary locks. At a few hundred devices this is
+  not a performance question.
+- Call audio is forwarded by the call's own task reading and writing UDP
+  sockets. There is no special "media plane" — no core pinning, no real-time
+  scheduling, no lock-free ring buffers. If we ever need them, the design has a
+  clear seam to add them; we don't build that now.
+- **State is memory-only.** Registrations expire and re-register; calls are
+  rebuilt from nothing after a restart. Nothing is persisted except logs.
 
+## 4. Configuration
+
+A single TOML file, written by a human, validated at startup. If it is invalid,
+the daemon refuses to start and says why. There is no runtime configuration
+API and no reload mechanism in v1 (restart the process to apply changes).
+
+```toml
+# /etc/softpbx/config.toml
+
+[general]
+sip_bind = "0.0.0.0:5060"
+rtp_port_range = "10000-10800"
+log_level = "info"
+call_log = "/var/log/softpbx/calls.ndjson"
+
+[[device]]
+number = "1001"
+name = "Alice"
+secret = "change-me"        # what the phone uses to register
+
+[[device]]
+number = "1002"
+name = "Bob"
+secret = "change-me-too"
+
+# Call routing: first matching rule wins.
+[[routing]]
+match = "1XXX"              # what the caller dialed (glob-style)
+target = "device"           # ring the device with that number
+
+[[routing]]
+match = "0"                 # example: operator
+target = "1001"
 ```
-sip-syntax ─┬─ sip-stack ──── call ──── api
-            │      │           │
-rtp ────────┴─ media ──┬── vbd ─┴─ faxserver
-                       └── t38
-line-gw(ゲートウェイ制御) ── call
-store ── call / api / faxserver
-engine-sim ── (テスト専用、上記すべてを利用)
-```
 
-- `sip-syntax` は依存のない純粋な構文層。ここにファジングを重点配置する。
-- `media` / `rtp` は `tokio` に依存しない（生スレッド + `libc`/`socket2`）。
-- `api` は `axum` 系。`store` は `serde` のみを前提とし、保存形式は TOML + NDJSON。
+Later additions to this file: ring groups, trunk definitions, per-device quirk
+profiles. No separate quirk files, no per-entity directories.
 
-## 8. セキュリティ
+## 5. Logging
 
-| 対象 | 対策 |
+- Human-readable structured logs to stdout (journald in production).
+- One append-only NDJSON call log: one line per call with start time, end time,
+  caller, callee, and outcome. This is what answers "why did that call fail?"
+  and "did that fax ever go out?" later on. Lines are appended and never
+  rewritten; a torn last line after a crash is ignored on startup.
+
+## 6. Security posture
+
+The system runs on a trusted office network or VPN. What we still do:
+
+- Digest authentication for phone registrations; a phone without the right
+  password cannot register or make calls.
+- Clear refusal of malformed or oversized SIP messages (no panics, no unbounded
+  memory growth).
+- No remote management surface at all, which is the simplest possible attack
+  surface reduction.
+
+We explicitly do not implement TLS, SRTP, intrusion detection, or rate limiting
+beyond basic sanity limits.
+
+## 7. Deliberate omissions (and why)
+
+| Omission | Why |
 | --- | --- |
-| 呼制御 | SIP over TLS（5061）、ダイジェスト認証、レート制限、失敗 IP の自動遮断 |
-| メディア | SRTP、RTCP の検証、不正 SDES の拒否 |
-| 拠点間 | SIP TLS + SRTP、必要なら経路側で VPN（ルータ IPsec） |
-| 管理系 | TLS、ロール分離、監査ログ、認証失敗の記録 |
-| 設定 | 望ましくない設定値のスキーマ検証、変更の dry-run |
+| Database | A config file and a log file are enough at this scale |
+| Management API / UI | Config is a file; state is inspected in logs |
+| Desired-state config management | "Write the file, restart" is a complete workflow |
+| High availability | A crashed daemon restarts in seconds; calls re-establish |
+| Real-time media engineering | Tens of G.711 calls do not justify it |
+| Conference, recording, billing | Out of scope (docs/01) |
+
+## 8. Room left for later features
+
+Fax and dial-up modem support are explicitly *not* built now (docs/06), but the
+first phase keeps the seams open so they arrive as additions, not as rewrites:
+
+- **The audio path is a transparent byte pipe.** Forwarded audio is never
+  processed (no VAD, no packet-loss concealment, no AGC, no transcoding). Fax
+  and modem signals survive this path; they do not survive a DSP pipeline.
+  This is a day-one constraint, not a later change.
+- **Call states extend downward.** The call state machine reserves states after
+  `Answered` (a "data mode" for fax/modem, a "held" state for hold). v1 simply
+  has no transitions into them.
+- **The config file can grow.** Future `[[trunk]]`, `[[group]]` and gateway
+  entries fit the existing shape; no schema migration needed since nothing
+  reads it but the daemon.
+- **Call routing can grow a new target** ("send this call to the trunk", "this
+  number is a fax machine on a gateway port") without restructuring the rules.
+- **re-INVITE handling stays in the stack**, because fax/modem switching and
+  trunks will need mid-call media renegotiation. v1 just answers "keep things
+  as they are".

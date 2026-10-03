@@ -8,5 +8,3 @@ publish.workspace = true
 [dependencies]
 sip-stack = { path = "../sip-stack" }
 media = { path = "../media" }
-vbd = { path = "../vbd" }
-store = { path = "../store" }

@@ -10,5 +10,3 @@ call = { path = "../call" }
 sip-stack = { path = "../sip-stack" }
 rtp = { path = "../rtp" }
 media = { path = "../media" }
-t38 = { path = "../t38" }
-store = { path = "../store" }

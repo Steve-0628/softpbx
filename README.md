@@ -1,83 +1,94 @@
-# softpbx — ソフトウェア PBX 再実装プロジェクト
+# softpbx — a small SIP call server
 
-既存のソフトウェア PBX（MikoPBX 系）の設計と言語が陳腐化しているため、Rust で作り直す。
-**通話処理エンジン（SIP / RTP / メディア / アナログ回線制御）も自前実装**する。
+softpbx is a software phone system (a PBX) for a small office, written in Rust.
+SIP phones register to it and call each other through it. That is the core, and
+everything else is deliberately left out.
 
-- 実装言語: Rust（制御面・メディア面・ドライバ層） + TypeScript（Web UI）
-- 動作環境: VM / 自社サーバ（x86_64 / aarch64 Linux）
-- チーム規模: 2〜5 名
-- 詳細な設計は [docs/](docs/) を参照
+Design stance: **small, understandable, and honest about what it is not.**
 
-## スコープ（v1）
+- One binary, one config file written by a human, read at startup.
+- All state (registrations, ongoing calls) lives in memory. If the process
+  crashes, calls drop and phones re-register. That is acceptable for this use.
+- No web UI, no REST/gRPC API, no database, no TLS/SRTP, no high availability.
+- Protocols are implemented in this repository (a minimal SIP stack in Rust),
+  because the quirks of real phones are where the work actually is.
 
-### 入れる
+## What it does (v1)
 
-| 領域 | 内容 |
+| Feature | Notes |
 | --- | --- |
-| 通話 | 内線通話（SIP 端末・アナログ端末）、拠点間通話、保留・転送・会議、ダイヤルプラン |
-| ファックス | T.38 中継、G.711 パススルー、アナログ FAX 機の接続、ファックスサーバ（PDF 化・メール送信） |
-| アナログ | 外付けゲートウェイ（Yamaha NVR500/510 級）経由でアナログ端末（電話機・FAX・モデム）を接続、3.1kHz データ伝送 |
-| 拠点間 | MikoPBX 互換 SIP トランク（宅外 PBX との通話）、番号帯ルーティング、TLS/SRTP |
-| 管理系 | Web UI / API、設定管理（Desired State）、電話機/ゲートウェイ自動設定、軽量保守 |
+| Devices | Phones register with a number and a password |
+| Calls | Calls between devices with G.711 audio |
+| Call routing | Rules for where a call goes: what a dialed number means (which device to ring) |
 
-### 出す
+## What it does not do
 
-- **録音**（通話録音・モニタリング）
-- **課金**（料金計算・請求）
-- **外線（公衆回線）との接続** — 拠点間は IP（SIP トランク）のみ
-- **重い保守機能** — A/B 更新、フルシステムバックアップ/リストア、遠隔診�断パッケージなど
-- 留守番電話（メッセージ録音を伴うため実質的に録音機能。必要なら音声応答のみ別途）
+Recording, billing, public phone network (PSTN) access, voicemail, IVR/call
+center features, conferencing, fax *(later, if ever)*, web UI, remote
+management APIs, provisioning of phones or gateways, TLS/SRTP, clustering or
+hot failover.
 
-## リポジトリ構成
+Later (not in the first phase): hold/transfer, ring groups (ring several phones
+at once, first to answer wins), a SIP trunk to a remote MikoPBX-compatible PBX,
+and fax / dial-up modem traffic. The design keeps room for all of these — see
+[docs/06-later.md](docs/06-later.md) — but the first phase is just calls.
+
+Analog phones, fax machines and modems can be reached through an external
+analog gateway (e.g. a Yamaha NVR500/510-class box), configured by hand from
+[docs/06-later.md](docs/06-later.md). softpbx sees such devices as ordinary SIP
+endpoints.
+
+## Repository layout
 
 ```
 softpbx/
-├── docs/                  設計ドキュメント（01〜08、番号順に読む）
-├── crates/                ライブラリクレート群
-│   ├── sip-syntax/        SIP メッセージ・SDP の構文解析
-│   ├── sip-stack/         トランスポート・トランザクション・ダイアログ
-│   ├── rtp/               RTP/RTCP、DTMF、ジッタバッファ
-│   ├── media/             コーデック、ミキサ、エコー除去、DSP パイプライン
-│   ├── vbd/               音声帯域データ（ファックス/モデム）検出・モード遷移
-│   ├── t38/               T.38 ゲートウェイ（T.30 ↔ UDPTL）
-│   ├── faxserver/         ファックスサーバ（TIFF/PDF/メール送受信）
-│   ├── line-hw/           アナログ回線 HAL（FXO/FXS、クロック同期、着信信号）
-│   ├── call/              コール FSM、ルーティング、通話機能
-│   ├── store/             設定 Desired State、通話ログ（ファイルベース、DB 不使用）
-│   ├── api/               REST / WebSocket / gRPC、認証・権限・監査
-│   └── engine-sim/        決定的シミュレーションテスト基盤
-├── apps/
-│   ├── pbx-daemon/        メインプロセス
-│   └── pbx-cli/           運用 CLI
-└── ui/                    Web UI（TypeScript）
+├── docs/            design docs (01-06, read in order)
+├── crates/
+│   ├── sip-syntax/  SIP message and SDP parsing (pure, no I/O)
+│   ├── sip-stack/   transport, transactions, dialogs
+│   ├── call/        call logic (B2BUA), call routing
+│   ├── rtp/         RTP packet handling and forwarding
+│   ├── media/       jitter buffer, G.711, later mixing
+│   └── engine-sim/  deterministic simulation test bed
+└── apps/
+    └── pbx-daemon/  the whole program
 ```
 
-## ドキュメント
+Crates for fax (`t38`, `vbd`, `faxserver`), gateway management (`line-gw`) and
+the old management plane (`api`, `store`) are removed from the tree until such
+features come back.
 
-| ファイル | 内容 |
-| --- | --- |
-| [docs/01-scope.md](docs/01-scope.md) | 要件・非機能・スコープ外・要確認事項 |
-| [docs/02-architecture.md](docs/02-architecture.md) | 全体アーキテクチャ・プロセス/スレッドモデル |
-| [docs/03-media-and-analog.md](docs/03-media-and-analog.md) | メディア面・アナログ回線・VBD の設計 |
-| [docs/04-fax.md](docs/04-fax.md) | ファックス（T.38 / パススルー / FAX 機 / サーバ）の設計 |
-| [docs/05-protocol-scope.md](docs/05-protocol-scope.md) | 対応プロトコル一覧と優先度 |
-| [docs/06-testing.md](docs/06-testing.md) | テスト戦略（決定的シミュレーション・ファズ・相互運用） |
-| [docs/07-milestones.md](docs/07-milestones.md) | マイルストーンと出口条件 |
-| [docs/08-acceptance-m0.md](docs/08-acceptance-m0.md) | M0 の受け入れテスト一覧 |
-
-## 開発の原則
-
-1. **メディア面のリアルタイム性を最優先する。** オーディオパスでメモリ確保・ロック・ログ出力・ファイル I/O をしない。
-2. **設定は宣言的 Desired State。** 実行中の設定ファイルを直接書き換えない。
-3. **すべての状態遷移は明示的な FSM として書く**（通話・ファックス・モデム・キュー）。テスト可能にするため。
-4. **「動く」より「検証できる」。** 決定的シミュレーションテスト（docs/06）を実装の前に用意する。
-5. **フィールド汚染（互換性クイーク）は表データで管理する。** 標準準拠コードに if を混ぜない。
-
-## 開発の進め方
+## Getting started
 
 ```bash
-cargo check --workspace        # 型チェック
-cargo clippy --workspace       # リント
-cargo test  --workspace        # ユニットテスト
-cargo run -p engine-sim        # 決定的シミュレーション（回帰）
+cargo check --workspace     # type check
+cargo test  --workspace     # unit tests + simulation tests
+cargo run -p pbx-daemon -- --config config.toml
 ```
+
+A minimal config file is described in [docs/02-architecture.md](docs/02-architecture.md).
+
+## Documentation
+
+| File | Contents |
+| --- | --- |
+| [docs/01-scope.md](docs/01-scope.md) | What we build, what we don't, and why |
+| [docs/02-architecture.md](docs/02-architecture.md) | How the program is put together |
+| [docs/03-calls.md](docs/03-calls.md) | How a call works, in plain terms |
+| [docs/04-testing.md](docs/04-testing.md) | Test strategy and the simulation test bed |
+| [docs/05-roadmap.md](docs/05-roadmap.md) | Order of work and exit criteria |
+| [docs/06-later.md](docs/06-later.md) | Future work: trunk, analog gateways, fax, modems |
+| [docs/07-sip-subset.md](docs/07-sip-subset.md) | Exactly which parts of SIP we implement (and which we don't) |
+| [docs/08-build-phases.md](docs/08-build-phases.md) | How the code gets built, phase by phase |
+
+## Principles
+
+1. **Calls first.** A change that does not make calling more reliable or more
+   understandable needs a good reason to exist.
+2. **Boring and explicit.** State machines are written out as enums and
+   transition tables. No clever abstractions before they are needed.
+3. **Real phones are the spec.** The written standard is a hint; what matters is
+   that actual phones work. Device quirks live in data tables, not in `if`
+   statements scattered through the code.
+4. **Reproducible tests.** Failures must be reproducible from a fixed seed, so
+   bugs can be found and fixed without a phone on the desk.
