@@ -80,6 +80,7 @@ A minimal config file is described in [docs/02-architecture.md](docs/02-architec
 | [docs/06-later.md](docs/06-later.md) | Future work: trunk, analog gateways, fax, modems |
 | [docs/07-sip-subset.md](docs/07-sip-subset.md) | Exactly which parts of SIP we implement (and which we don't) |
 | [docs/08-build-phases.md](docs/08-build-phases.md) | How the code gets built, phase by phase |
+| [docs/09-softphone-testing.md](docs/09-softphone-testing.md) | Real-phone testing notes and interop findings |
 
 ## Principles
 

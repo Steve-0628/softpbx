@@ -152,6 +152,13 @@ impl Message {
     }
 }
 
+/// Whether this datagram is a transport keepalive rather than a message:
+/// just CRLFs (RFC 5626 double-CRLF ping). Real phones send these constantly;
+/// there is nothing to parse and nothing to answer beyond a bare CRLF.
+pub fn is_keepalive(input: &[u8]) -> bool {
+    !input.is_empty() && input.iter().all(|&b| b == b'\r' || b == b'\n')
+}
+
 /// Canonical (lowercase, long form) name of a header field.
 ///
 /// Single-letter compact forms (RFC 3261 §7.3.3) are expanded first:

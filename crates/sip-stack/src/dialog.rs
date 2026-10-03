@@ -97,13 +97,14 @@ impl Dialog {
     }
 }
 
-/// The URI inside a header value: strips `<`/`>` and any `;params`.
+/// The URI inside a header value: takes what is between `<...>`, skipping any
+/// display name (`"Alice" <sip:alice@host>`), and strips `;params` otherwise.
 pub fn uri_of(value: &str) -> &str {
     let value = value.trim();
-    let value = value
-        .strip_prefix('<')
-        .map(|rest| rest.split('>').next().unwrap_or(rest))
-        .unwrap_or(value);
+    if let Some(start) = value.find('<') {
+        let rest = &value[start + 1..];
+        return rest.split('>').next().unwrap_or(rest).trim();
+    }
     value.split(';').next().unwrap_or(value).trim()
 }
 

@@ -143,6 +143,18 @@ fn folded_line_without_previous_header_is_bad_header() {
 }
 
 #[test]
+fn keepalives_are_recognized() {
+    // Real phones ping with double-CRLF (RFC 5626); linphone sends exactly
+    // these four bytes every few seconds.
+    assert!(sip_syntax::is_keepalive(b"\r\n\r\n"));
+    assert!(sip_syntax::is_keepalive(b"\r\n"));
+    assert!(sip_syntax::is_keepalive(b"\n"));
+    assert!(!sip_syntax::is_keepalive(b""));
+    assert!(!sip_syntax::is_keepalive(b"OPTIONS sip:x SIP/2.0\r\n\r\n"));
+    assert!(!sip_syntax::is_keepalive(b"\r\nx\r\n"));
+}
+
+#[test]
 fn bad_start_lines_are_rejected() {
     for raw in [
         &b"\r\nContent-Length: 0\r\n\r\n"[..],      // empty start line

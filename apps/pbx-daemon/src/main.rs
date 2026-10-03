@@ -45,6 +45,11 @@ impl Pbx {
 
     /// One SIP datagram arrived: parse, feed the switch, send what it says.
     async fn handle_sip(&self, data: &[u8], source: SocketAddr) {
+        // Keepalive pings (RFC 5626) get a bare CRLF back and nothing else.
+        if sip_syntax::is_keepalive(data) {
+            let _ = self.sip.send_to(b"\r\n", source).await;
+            return;
+        }
         let Ok(message) = parse_message(data) else {
             log(format!("dropped unparsable message from {source}"));
             return;
