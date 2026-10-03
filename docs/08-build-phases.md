@@ -66,8 +66,80 @@ already proven.
 **Done when:** the daemon starts from a config file and the phase 1–5 suite
 still passes.
 
-## Phase 7+ — Roadmap steps 2–5
+## Phase 7 — Softphone hardening (finishes roadmap step 2)
 
-Real phones and device quirks (step 2) → call routing (step 3) → trunk
-(step 4) → analog devices, fax, modems (step 5). Each of those is planned and
-reviewed when it starts, not before.
+Step 2 is *mostly* done: round 1 (linphone ↔ baresip through the PBX) and two
+independent review rounds are behind us. What remains is making it boring:
+
+- Regression round 2 over real phones: both hang-up directions, keepalives,
+  mid-call re-INVITEs (session refresh), CANCEL-as-the-callee-answers, a
+  restart mid-call
+- A third phone type (twinkle) and at least one hardphone when available
+- Stress: SIPp scenario with 50+ concurrent calls; a multi-hour soak with
+  periodic calls; zero stuck calls, zero leaked media ports
+- Device quirk data tables as devices demand them (none needed yet)
+
+**Done when:** two different phone types run calls for hours (both directions,
+all hang-up ways) without a stuck call or a leaked resource; the stress and
+soak runs pass; findings are in docs/09.
+
+## Phase 8 — Call routing (roadmap step 3)
+
+- `[[routing]]` config sections: match (what was dialed) → target, with number
+  rewriting and rejection; normalization rules (`+81…`, leading digits)
+- Refuse calls to nowhere with a clear code (`404` today becomes "no rule
+  matched")
+
+**Done when:** routing works on real phones and every rule has a simulation
+test; the config validator rejects nonsense rules at startup.
+
+## Phase 9 — Trunk core (roadmap step 4, part one)
+
+Before touching a real peer, the trunk exists in the simulation:
+
+- `[[trunk]]` config: peer address, authentication (digest and/or IP), its
+  number range and ours
+- Outbound: routing rules that send a number range down a trunk; the callee
+  leg becomes a trunk leg (its own Call-IDs, its own quirks)
+- Inbound: INVITEs from the trunk authenticate (this is where digest-on-INVITE
+  gets built — a trunk peer does not "register"), map to local devices
+- Whatever the peer forces into the SIP subset (likely UPDATE / session
+  timers / 100rel — decided by what MikoPBX actually sends, docs/07 grown
+  first, per its §4 rules)
+
+**Done when:** site-to-site call scenarios (both directions, busy, no-answer,
+hang-up both sides, lost packets) pass in the DST against a fake remote PBX.
+
+## Phase 10 — MikoPBX interop (roadmap step 4, part two)
+
+The real thing — this needs a MikoPBX instance to talk to (external
+dependency: provided or installed here).
+
+- Bring-up: registration/trunk both directions, calls site to site
+- Interop matrix in docs/09 per behavior (session refresh, re-INVITE order,
+  caller-ID handling, CANCEL/BYE races) with quirk-table entries for each
+  divergence
+- Soak: 72 hours of periodic site-to-site calls
+
+**Done when:** site-to-site calls and hang-ups work reliably against the real
+MikoPBX; every divergence is either fixed or recorded as a quirk; the soak is
+clean.
+
+## Phase 11 — Analog devices, fax, modems (roadmap step 5, when wanted)
+
+- Gateway setup documented and verified (docs/06 §2); analog phones as devices
+- G.711 fax pass-through first, tested against real machines; dial-up modem
+  expectations documented honestly (LAN only)
+- T.38 relay and a fax server only if pass-through proves insufficient
+
+**Done when:** whatever subset is actually wanted works against real
+hardware, and what does not work is documented rather than guessed.
+
+## Notes on the phasing
+
+- Phases 7 and 8 are independent of the trunk; 9 must precede 10 (never point
+  a real peer at unproven signaling); 11 is optional.
+- Phases are cut so each ends in something *verified*: a soak, a matrix, a
+  green scenario set — not a code-complete milestone.
+- Reviews stay part of the process: a fresh-eyes review at each phase
+  boundary, before the next phase starts.
