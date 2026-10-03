@@ -14,7 +14,7 @@ test VM; what belongs here is what the **devices taught us about our code**.
 | Call B → A (reverse direction) | ✅ |
 | RTP relayed both ways, correct relay ports | ✅ phones send to the port we advertised; we forward from the port the other side expects |
 | ptime negotiation | ✅ baresip adopted our `a=ptime:10` |
-| BYE teardown both legs | ✅ |
+| BYE teardown (caller side) | ✅ — the callee side was *not* tested here and turned out to be broken; see §2 |
 | Call log line per call | ✅ `{"caller","callee","started_ms","ended_ms","result"}` |
 | Keepalives (`\r\n\r\n`) | ✅ answered with a bare CRLF (RFC 5626) |
 | Restart model | ✅ after a daemon restart phones re-register; calls to unregistered numbers get `404` + a `not-found` log line |
@@ -30,6 +30,12 @@ test VM; what belongs here is what the **devices taught us about our code**.
    `From: "1002" <sip:1002@...>`; our URI extraction took the whole value and
    produced `caller: "\"1002\" <sip:1002"`. Now `uri_of` skips display names.
    The simulation never sent one — real phones do.
+
+An independent review round after this test (three reviewers over code,
+docs and tests) then found the callee-side BYE bug, the swallowed re-INVITE,
+the leaking media ports and the fire-and-forget message lifecycle — all fixed
+with regression tests in `crates/engine-sim/tests/m0.rs`. The lesson from
+round 1 stands: **test both directions of everything with real phones.**
 
 ## 3. Operational notes
 

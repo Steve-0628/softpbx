@@ -19,7 +19,7 @@ Design stance: **small, understandable, and honest about what it is not.**
 | --- | --- |
 | Devices | Phones register with a number and a password |
 | Calls | Calls between devices with G.711 audio |
-| Call routing | Rules for where a call goes: what a dialed number means (which device to ring) |
+| Call routing | Rules for where a call goes — **not built yet**, roadmap step 3 (today a dialed number rings the device with that number) |
 
 ## What it does not do
 
@@ -48,7 +48,7 @@ softpbx/
 │   ├── sip-stack/   transport, transactions, dialogs
 │   ├── call/        call logic (B2BUA), call routing
 │   ├── rtp/         RTP packet handling and forwarding
-│   ├── media/       jitter buffer, G.711, later mixing
+│   ├── media/       G.711 and SDP, later mixing
 │   └── engine-sim/  deterministic simulation test bed
 └── apps/
     └── pbx-daemon/  the whole program
@@ -63,7 +63,7 @@ features come back.
 ```bash
 cargo check --workspace     # type check
 cargo test  --workspace     # unit tests + simulation tests
-cargo run -p pbx-daemon -- --config config.toml
+cargo run -p pbx-daemon -- path/to/config.toml
 ```
 
 A minimal config file is described in [docs/02-architecture.md](docs/02-architecture.md).

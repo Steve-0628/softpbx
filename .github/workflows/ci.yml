@@ -41,7 +41,7 @@ jobs:
         run: cargo test --workspace
         if: matrix.target == 'x86_64-unknown-linux-gnu'
 
-  # 決定的シミュレーション（docs/06）。シード固定のため結果は常に再現される。
+  # Deterministic simulation (docs/04). Fixed seeds: results always reproduce.
   dst:
     runs-on: ubuntu-latest
     needs: lint
@@ -52,7 +52,7 @@ jobs:
       - name: deterministic simulation
         run: cargo test -p engine-sim --release
 
-  # 構文解析器への短時間ファズ（docs/06 §4）。フル実行は定期ジョブで行う。
+  # Short fuzz of the parsers (docs/04). Full runs go in a scheduled job.
   fuzz-smoke:
     runs-on: ubuntu-latest
     needs: lint

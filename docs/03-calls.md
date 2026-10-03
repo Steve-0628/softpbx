@@ -36,32 +36,40 @@ very widely supported). The PBX forwards audio roughly every 10–20 ms.
 
 ## 3. Call states
 
-Every call is a small state machine. Roughly:
+Every call is a small state machine (the real ones live in `call/src/call.rs`):
 
 ```
-Idle → Offering → Ringing → Answered → Terminating → Terminated
-                      ↘ Rejected / Failed
+Offering → Ringing → Answered → Terminating → Terminated
 ```
 
-Transfers and hold would add states on top of `Answered`; they are not in the
-first phase (docs/01), but the state machine reserves room for them. The rules
-are written out explicitly (an enum plus a transition function), because "what
-happens if Bob hangs up while the call is being set up" is exactly the kind of
-question we want to answer with a test rather than with a phone on a desk.
+- `Offering`: the INVITE arrived; the callee has not been reached yet
+- `Ringing`: the callee is being alerted (a 180/183 came back)
+- `Answered`: the call is up
+- `Terminating` → `Terminated`: teardown messages go out, then the call log
+  line is written
 
-## 4. Call routing
+A BYE ends the call from *any* of the first three states; a CANCEL ends it
+while it is still being set up. Hold and transfer would add states on top of
+`Answered` — they are not wanted yet (docs/01), and adding them means adding
+enum variants and transitions, nothing more. The rules are written out
+explicitly (an enum plus a transition function), because "what happens if Bob
+hangs up while the call is being set up" is exactly the kind of question we
+want to answer with a test rather than with a phone on a desk.
 
-Call routing is a list of rules: *"when someone dials something matching this
-pattern, do that"*. First match wins. In v1 the actions are:
+## 4. Call routing (not built yet)
+
+The plan: a list of rules — *"when someone dials something matching this
+pattern, do that"*, first match wins — with number rewriting and rejection
+along the way. Today there are no rules at all: a dialed number simply rings
+the device with that number, and anything else gets `404`.
+
+This is roadmap step 3 (docs/05). When it lands, the actions will be:
 
 | Action | Meaning |
 | --- | --- |
 | `device` | Ring the device whose number was dialed |
 | `device` with a fixed number | Ring that specific device |
 | `reject` | Don't allow this number (e.g. dial 0 for outside line → no) |
-
-Number rewriting (dial `9` to get `1002`, or normalize `+81...`) is a small
-step attached to a rule.
 
 Later: ring groups, rules that send a call to a trunk (remote PBX), rules for a
 fax machine on a gateway port.
@@ -93,8 +101,10 @@ Actual phones and PBXs bend the rules. We handle that in one place:
 
 - The standard-following code path stays clean.
 - Per-device behavior differences (odd header ordering, unusual re-INVITE
-  timing, how a device signals DTMF keys) live in **data tables** — one entry
-  per device type, added when we meet the device.
+  timing, how a device signals DTMF keys) go into **data tables** — one entry
+  per device type, added when we first meet the device. (None yet: the
+  softphones we have tested against behave. The tables appear with the first
+  quirk, not before.)
 - Each quirk entry gets a test in the simulation bed so we know when it breaks.
 
 This is the difference between "works with my softphone" and "works with the

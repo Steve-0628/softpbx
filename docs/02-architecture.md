@@ -12,7 +12,7 @@ clusters.
                   │  pbx-daemon                         │
                   │                                     │
                   │  sip-stack   transactions, dialogs  │
-                  │  call        call logic, routing    │
+                  │  call        call logic             │
                   │  rtp         audio forwarding       │
                   │                                     │
                   │  state in memory:                   │
@@ -28,9 +28,9 @@ clusters.
 | Crate | Responsibility |
 | --- | --- |
 | `sip-syntax` | Parse and serialize SIP messages and SDP. Pure functions, no I/O, no dependencies. Malformed input must produce an error, never a panic. |
-| `sip-stack` | UDP transport, SIP transactions (request/response matching, retransmission), dialogs (a call's signaling session). |
-| `call` | The actual PBX logic: who is registered, what a dialed number means, what happens when someone answers or hangs up. Each call is a small state machine. |
-| `rtp` | RTP packet parsing and forwarding between the two sides of a call. Small jitter buffer for audio smoothness. |
+| `sip-stack` | SIP transactions (request/response matching, retransmission, timers) and dialogs (a call's signaling session). The sockets live in the daemon; this crate is pure. |
+| `call` | The actual PBX logic: who is registered, where a dialed number goes, what happens when someone answers or hangs up. Each call is a small state machine. |
+| `rtp` | RTP packet parsing and forwarding between the two sides of a call — byte for byte, unprocessed. |
 | `media` | G.711 handling; later, audio mixing if any feature needs it. |
 | `engine-sim` | The deterministic simulation test bed (docs/04). |
 
@@ -39,63 +39,63 @@ and `rtp`. Nothing depends on `engine-sim`.
 
 ## 3. Concurrency and state
 
-- tokio tasks: one for the SIP socket, one per call (both signaling and audio
-  forwarding for that call), one for logging.
-- Shared state is small and coarse: a table of registered devices and a table
-  of active calls, behind ordinary locks. At a few hundred devices this is
+- tokio tasks, one per piece of I/O: one for the SIP socket, one per media
+  relay port, one timer tick loop. A call is just data inside the switch —
+  there are no per-call tasks and no separate media plane.
+- Shared state is small and coarse: the switch (calls) and the registrar
+  (devices, bindings) behind ordinary locks. At a few hundred devices this is
   not a performance question.
-- Call audio is forwarded by the call's own task reading and writing UDP
-  sockets. There is no special "media plane" — no core pinning, no real-time
-  scheduling, no lock-free ring buffers. If we ever need them, the design has a
-  clear seam to add them; we don't build that now.
+- Call audio is relayed by the media-port tasks reading and writing UDP
+  sockets. No core pinning, no real-time scheduling, no lock-free rings. If we
+  ever need them, the design has a clear seam to add them; we don't build that
+  now.
 - **State is memory-only.** Registrations expire and re-register; calls are
   rebuilt from nothing after a restart. Nothing is persisted except logs.
 
 ## 4. Configuration
 
 A single TOML file, written by a human, validated at startup. If it is invalid,
-the daemon refuses to start and says why. There is no runtime configuration
-API and no reload mechanism in v1 (restart the process to apply changes).
+the daemon refuses to start and says why. Unknown keys are refused too: a typo
+or a leftover section is an error, not silence. There is no runtime
+configuration API and no reload mechanism in v1 (restart the process to apply
+changes).
 
 ```toml
 # /etc/softpbx/config.toml
 
 [general]
-sip_bind = "0.0.0.0:5060"
-rtp_port_range = "10000-10800"
-log_level = "info"
+realm = "softpbx"                 # digest-authentication realm
+sip_bind = "0.0.0.0:5060"         # where we listen for SIP
+pbx_host = "192.0.2.10:5060"      # our address as devices see it (Via/Contact)
+rtp_host = "192.0.2.10"           # our IP as devices see it (SDP media)
+rtp_port_base = 10000             # first media relay port
+rtp_ports = 100                   # ports to bind (two per concurrent call)
 call_log = "/var/log/softpbx/calls.ndjson"
 
 [[device]]
 number = "1001"
 name = "Alice"
-secret = "change-me"        # what the phone uses to register
+secret = "change-me"              # what the phone uses to register
 
 [[device]]
 number = "1002"
 name = "Bob"
 secret = "change-me-too"
-
-# Call routing: first matching rule wins.
-[[routing]]
-match = "1XXX"              # what the caller dialed (glob-style)
-target = "device"           # ring the device with that number
-
-[[routing]]
-match = "0"                 # example: operator
-target = "1001"
 ```
 
-Later additions to this file: ring groups, trunk definitions, per-device quirk
-profiles. No separate quirk files, no per-entity directories.
+Call routing (rules for where a dialed number goes) is **not built yet**: today
+a dialed number simply rings the device with that number. Routing rules are
+roadmap step 3 (docs/05) and will get their own sections in this file. The
+same goes for future ring groups and trunk definitions.
 
 ## 5. Logging
 
 - Human-readable structured logs to stdout (journald in production).
-- One append-only NDJSON call log: one line per call with start time, end time,
-  caller, callee, and outcome. This is what answers "why did that call fail?"
-  and "did that fax ever go out?" later on. Lines are appended and never
-  rewritten; a torn last line after a crash is ignored on startup.
+- One append-only NDJSON call log: one line per call with the caller, the
+  callee, start/end offsets in milliseconds since the daemon started, and the
+  outcome. This is what answers "why did that call fail?" later on. Lines are
+  appended and never rewritten; a torn last line after a crash is ignored on
+  startup.
 
 ## 6. Security posture
 
@@ -131,9 +131,9 @@ first phase keeps the seams open so they arrive as additions, not as rewrites:
   processed (no VAD, no packet-loss concealment, no AGC, no transcoding). Fax
   and modem signals survive this path; they do not survive a DSP pipeline.
   This is a day-one constraint, not a later change.
-- **Call states extend downward.** The call state machine reserves states after
-  `Answered` (a "data mode" for fax/modem, a "held" state for hold). v1 simply
-  has no transitions into them.
+- **Call states extend downward.** The call state machine is one enum and one
+  transition function; adding a "data mode" for fax/modem later means adding
+  variants and transitions, not restructuring. v1 simply has no such states.
 - **The config file can grow.** Future `[[trunk]]`, `[[group]]` and gateway
   entries fit the existing shape; no schema migration needed since nothing
   reads it but the daemon.

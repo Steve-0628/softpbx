@@ -17,8 +17,9 @@ one team can hold entirely in their heads.
 - Registration: a device (today: a phone) registers with a number (e.g. `1001`)
   and a password (SIP digest authentication).
 - Calls between devices: ringing, answering, G.711 audio both ways, hanging up.
-- Call routing: a small set of rules mapping a dialed number to a destination.
-  Number rewriting and "this number is not allowed" rules.
+- Call routing: rules mapping a dialed number to a destination, with number
+  rewriting and rejection. *(Not built yet — roadmap step 3. Today a dialed
+  number simply rings the device with that number.)*
 
 ### Later
 

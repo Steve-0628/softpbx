@@ -50,8 +50,8 @@ call-log line) are green.
 
 ## Phase 5 — Audio (`rtp`)
 
-RTP forwarding between the two legs, small jitter buffer, G.711 handling — the
-transparent byte pipe (docs/02 §8).
+RTP forwarding between the two legs, byte for byte (no jitter buffer in the
+relay — endpoints buffer), G.711 handling — the transparent pipe (docs/02 §8).
 
 **Done when:** DST tests 3 and 5 (60 s lossless call; 10 concurrent calls) are
 green — i.e. **all 7 exit criteria in [docs/04](04-testing.md) §3 pass**.

@@ -54,9 +54,11 @@ for now: hold and transfer are not in the first phase, docs/01.)
 - Contact bindings with expiry; `Expires: 0` removes a binding; stale bindings
   are swept.
 - Digest authentication (MD5, with and without `qop`): `REGISTER` is
-  challenged, wrong password → `401`/`403`, unknown number → `403`.
-- `INVITE` from a non-registered source is rejected (v1 trusts the LAN, but not
-  blindly).
+  challenged, wrong password → `401`, unknown number → `403`. Only nonces we
+  issued verify, so a sniffed response cannot be replayed.
+- **Only registered devices may place calls**: an `INVITE` whose caller has no
+  live binding gets `403`. (No digest challenge on `INVITE` itself — being
+  registered is the admission ticket.)
 
 ### NAT hygiene
 - `rport` / `received` (RFC 3581) on responses. Cheap, and it is why phones
@@ -72,9 +74,12 @@ for now: hold and transfer are not in the first phase, docs/01.)
   quirks): accepted and answered with the current session unchanged.
 
 ### Response codes we use
-`100`, `180`, `183`, `200`, `400`, `401`, `403`, `404`, `405`, `408`, `413`,
-`415`, `480`, `486`, `487`, `488`, `491`, `500`, `503`. Nothing else needs to
-exist in the code.
+
+Originated by us: `100` (auto), `180`/`183` (callee progress, forwarded with
+its real code), `200`, `400`, `401`, `403`, `404`, `405`, `408`, `481`, `487`,
+`503`. Final responses from the callee are forwarded as-is (a `486` from a busy
+phone arrives as `486`). `488`, `491` and `500` are defined for later use.
+Nothing else needs to exist in the code.
 
 ## 2. Not implemented (on purpose)
 
@@ -82,7 +87,8 @@ Rejected with a standard error response or ignored:
 
 - Methods: `REFER`, `NOTIFY`, `INFO`, `PRACK`, `UPDATE`, `SUBSCRIBE`,
   `PUBLISH`, `MESSAGE`
-- SIP extensions: 100-rel, session timers (RFC 4028), Path, Outbound (RFC 5626),
+- SIP extensions: 100-rel, session timers (RFC 4028), Path, Outbound (RFC 5626
+  — except its double-CRLF keepalive, which is recognized and acknowledged),
   GRUU, replaces, event packages (BLF, message waiting)
 - Media negotiation: ICE, RTCP, SRTP (`a=crypto`), RTCP-mux, multiple codecs
   beyond G.711
