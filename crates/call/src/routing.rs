@@ -10,6 +10,9 @@
 pub enum Destination {
     /// Ring the device with this number.
     Ring(String),
+    /// Send the call down a trunk to another PBX, addressed with this number
+    /// (docs/03 §4, docs/06 §1).
+    Trunk(String, String),
     /// The number is not allowed (docs/03: "dial 0 for an outside line → no").
     Reject,
 }
@@ -33,6 +36,8 @@ pub enum Action {
     Dialed,
     /// Ring this specific number.
     Number(String),
+    /// Send it down this trunk, addressed with the (possibly stripped) number.
+    Trunk(String),
     /// Refuse the call.
     Reject,
 }
@@ -55,6 +60,7 @@ pub fn route(rules: &[Rule], dialed: &str) -> Destination {
         return match &rule.action {
             Action::Dialed => Destination::Ring(number.to_string()),
             Action::Number(number) => Destination::Ring(number.clone()),
+            Action::Trunk(trunk) => Destination::Trunk(trunk.clone(), number.to_string()),
             Action::Reject => Destination::Reject,
         };
     }

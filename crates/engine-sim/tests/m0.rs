@@ -43,6 +43,7 @@ fn switch_with_routing(devices: Vec<Device>, rtp_ports: u16, routing: Vec<call::
         rtp_port_base: 10_000,
         rtp_ports,
         routing,
+        trunks: vec![],
         devices,
     })
 }
@@ -66,6 +67,16 @@ fn switch() -> Switch {
 
 /// Bytes in → parse → switch → outputs, with both ends traced.
 fn feed(world: &mut World, switch: &mut Switch, raw: &[u8]) -> Vec<Output> {
+    feed_from(world, switch, raw, None)
+}
+
+/// The same, as if the message arrived from `from` (a trunk peer, say).
+fn feed_from(
+    world: &mut World,
+    switch: &mut Switch,
+    raw: &[u8],
+    from: Option<std::net::SocketAddr>,
+) -> Vec<Output> {
     let message = parse_message(raw).expect("our own messages parse");
     match &message {
         Message::Request(request) => world.log(format!(
@@ -77,7 +88,7 @@ fn feed(world: &mut World, switch: &mut Switch, raw: &[u8]) -> Vec<Output> {
             world.log(format!("phone -> pbx: {}", response.status));
         }
     }
-    let outputs = switch.handle(message, world.now_ms());
+    let outputs = switch.handle(message, world.now_ms(), from);
     for output in &outputs {
         match output {
             Output::Send(Message::Request(request)) => world.log(format!(

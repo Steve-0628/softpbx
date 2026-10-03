@@ -19,9 +19,22 @@ pub struct FileConfig {
     /// dialed number simply rings the device with that number.
     #[serde(default)]
     pub routing: Vec<RoutingRule>,
+    /// Trunks to other PBXs (docs/06 §1). Optional.
+    #[serde(default)]
+    pub trunk: Vec<TrunkCfg>,
     /// Devices that may register and be called.
     #[serde(default)]
     pub device: Vec<DeviceCfg>,
+}
+
+/// One `[[trunk]]`: a PBX we exchange calls with (docs/06 §1).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrunkCfg {
+    /// Label used in `to = "trunk:<name>"` routing rules and in logs.
+    pub name: String,
+    /// Its address, "ip:port" (usually 5060).
+    pub peer: String,
 }
 
 /// One `[[routing]]` rule: `match` a dialed number, `to` a destination.
@@ -43,7 +56,10 @@ impl RoutingRule {
         let action = match self.to.as_str() {
             "dialed" => call::Action::Dialed,
             "reject" => call::Action::Reject,
-            number => call::Action::Number(number.to_string()),
+            destination => match destination.strip_prefix("trunk:") {
+                Some(name) => call::Action::Trunk(name.to_string()),
+                None => call::Action::Number(destination.to_string()),
+            },
         };
         call::Rule {
             pattern: self.pattern.clone(),
@@ -140,13 +156,26 @@ impl FileConfig {
             }
             let known = rule.to == "dialed"
                 || rule.to == "reject"
+                || rule
+                    .to
+                    .strip_prefix("trunk:")
+                    .is_some_and(|name| !name.is_empty())
                 || (!rule.to.is_empty() && rule.to.bytes().all(|b| b.is_ascii_digit()));
             if !known {
                 bail!(
-                    "routing match \"{}\": to must be \"dialed\", \"reject\" or a number, got \"{}\"",
+                    "routing match \"{}\": to must be \"dialed\", \"reject\", \"trunk:<name>\" or a number, got \"{}\"",
                     rule.pattern,
                     rule.to
                 );
+            }
+            if let Some(name) = rule.to.strip_prefix("trunk:") {
+                if !self.trunk.iter().any(|trunk| trunk.name == name) {
+                    bail!(
+                        "routing match \"{}\": no such trunk \"{}\"",
+                        rule.pattern,
+                        name
+                    );
+                }
             }
             if let Some(strip) = &rule.strip {
                 if rule.to != "dialed" {
@@ -162,6 +191,19 @@ impl FileConfig {
                     );
                 }
             }
+        }
+        let mut trunks = HashSet::new();
+        for trunk in &self.trunk {
+            if trunk.name.is_empty() {
+                bail!("a [[trunk]] has an empty name");
+            }
+            if !trunks.insert(trunk.name.clone()) {
+                bail!("duplicate trunk name \"{}\"", trunk.name);
+            }
+            trunk
+                .peer
+                .parse::<std::net::SocketAddr>()
+                .with_context(|| format!("trunk \"{}\": peer must be ip:port", trunk.name))?;
         }
         let mut numbers = HashSet::new();
         for device in &self.device {
@@ -198,6 +240,14 @@ impl FileConfig {
             rtp_port_base: self.general.rtp_port_base,
             rtp_ports: self.general.rtp_ports,
             routing: self.routing.iter().map(RoutingRule::to_rule).collect(),
+            trunks: self
+                .trunk
+                .iter()
+                .map(|trunk| call::TrunkConfig {
+                    name: trunk.name.clone(),
+                    peer: trunk.peer.parse().expect("validated"),
+                })
+                .collect(),
             devices: self
                 .device
                 .iter()
@@ -306,6 +356,26 @@ mod tests {
         let bad_strip =
             format!("{GOOD}\n[[routing]]\nmatch = \"9*\"\nto = \"reject\"\nstrip = \"9\"\n");
         assert!(FileConfig::parse(&bad_strip).is_err());
+    }
+
+    #[test]
+    fn trunk_rules_validate() {
+        let good = format!(
+            "{GOOD}\n[[trunk]]\nname = \"mikopbx\"\npeer = \"192.168.77.108:5060\"\n\n\
+             [[routing]]\nmatch = \"3*\"\nto = \"trunk:mikopbx\"\n"
+        );
+        let config = FileConfig::parse(&good).expect("valid trunk");
+        assert_eq!(config.trunk.len(), 1);
+        assert_eq!(config.switch_config().trunks.len(), 1);
+
+        // A route to a trunk that does not exist is refused at startup.
+        let dangling = format!("{GOOD}\n[[routing]]\nmatch = \"3*\"\nto = \"trunk:nope\"\n");
+        let error = FileConfig::parse(&dangling).expect_err("unknown trunk");
+        assert!(format!("{error:#}").contains("nope"), "{error:#}");
+
+        // A trunk needs a real address.
+        let bad_peer = format!("{GOOD}\n[[trunk]]\nname = \"m\"\npeer = \"over-there:5060\"\n");
+        assert!(FileConfig::parse(&bad_peer).is_err());
     }
 
     #[test]

@@ -15,6 +15,7 @@ fn switch() -> Switch {
         rtp_port_base: 10_000,
         rtp_ports: 100,
         routing: vec![],
+        trunks: vec![],
         devices: vec![
             Device {
                 number: "1001".to_string(),
@@ -70,7 +71,7 @@ fn register(switch: &mut Switch, number: &str, secret: &str, contact: &str, now_
         ],
         body: Vec::new(),
     };
-    let outputs = switch.handle(Message::Request(request), now_ms);
+    let outputs = switch.handle(Message::Request(request), now_ms, None);
     let challenge = response_of(&outputs, 401);
     let value = header(&challenge.headers, "WWW-Authenticate").unwrap();
     let nonce = &value[value.find("nonce=\"").unwrap() + 7..];
@@ -127,7 +128,7 @@ fn register(switch: &mut Switch, number: &str, secret: &str, contact: &str, now_
         uri: "sip:192.0.2.10".to_string(),
         body: Vec::new(),
     };
-    let outputs = switch.handle(Message::Request(request), now_ms);
+    let outputs = switch.handle(Message::Request(request), now_ms, None);
     assert_eq!(
         response_of(&outputs, 200).status,
         200,
@@ -215,7 +216,11 @@ fn call_logs(outputs: &[Output]) -> Vec<String> {
 #[test]
 fn unregistered_caller_gets_403() {
     let mut switch = switch();
-    let outputs = switch.handle(Message::Request(invite("6666", "1002", "call-auth")), 0);
+    let outputs = switch.handle(
+        Message::Request(invite("6666", "1002", "call-auth")),
+        0,
+        None,
+    );
     assert_eq!(
         response_of(&outputs, 403).status,
         403,
@@ -234,7 +239,11 @@ fn unknown_callee_gets_404() {
         "<sip:alice@192.0.2.1:5060>",
         0,
     );
-    let outputs = switch.handle(Message::Request(invite("1001", "9999", "call-404")), 0);
+    let outputs = switch.handle(
+        Message::Request(invite("1001", "9999", "call-404")),
+        0,
+        None,
+    );
     assert_eq!(response_of(&outputs, 404).status, 404);
     assert_eq!(switch.active_calls(), 0);
     assert!(!call_logs(&outputs).is_empty(), "the failed call is logged");
@@ -245,7 +254,7 @@ fn unknown_method_gets_405_with_allow() {
     let mut switch = switch();
     let mut request = invite("1001", "1002", "call-405");
     request.method = Method::Other("PUBLISH".to_string());
-    let outputs = switch.handle(Message::Request(request), 0);
+    let outputs = switch.handle(Message::Request(request), 0, None);
     let response = response_of(&outputs, 405);
     let allow = header(&response.headers, "Allow").expect("Allow header");
     assert_eq!(allow, call::ALLOW);
@@ -256,7 +265,7 @@ fn options_is_answered() {
     let mut switch = switch();
     let mut request = invite("1001", "1002", "call-opt");
     request.method = Method::Options;
-    let outputs = switch.handle(Message::Request(request), 0);
+    let outputs = switch.handle(Message::Request(request), 0, None);
     assert_eq!(response_of(&outputs, 200).status, 200);
 }
 
@@ -280,13 +289,13 @@ fn cancel_while_ringing_tears_down_both_legs() {
 
     // Alice calls Bob; Bob's phone rings.
     let alice_invite = invite("1001", "1002", "call-cancel");
-    let outputs = switch.handle(Message::Request(alice_invite.clone()), 0);
+    let outputs = switch.handle(Message::Request(alice_invite.clone()), 0, None);
     let callee_invite = (*requests_of(&outputs, Method::Invite)
         .first()
         .expect("INVITE toward the callee"))
     .clone();
     let ringing = tagged_response(&callee_invite, 180, "Ringing");
-    let outputs = switch.handle(Message::Response(ringing), 10);
+    let outputs = switch.handle(Message::Response(ringing), 10, None);
     assert_eq!(
         response_of(&outputs, 180).status,
         180,
@@ -294,7 +303,7 @@ fn cancel_while_ringing_tears_down_both_legs() {
     );
 
     // Alice changes her mind.
-    let outputs = switch.handle(Message::Request(cancel_of(&alice_invite)), 20);
+    let outputs = switch.handle(Message::Request(cancel_of(&alice_invite)), 20, None);
     assert_eq!(
         response_of(&outputs, 200).status,
         200,
@@ -320,7 +329,7 @@ fn bye_without_a_call_gets_481() {
     let mut switch = switch();
     let mut request = invite("1001", "1002", "call-bye");
     request.method = Method::Bye;
-    let outputs = switch.handle(Message::Request(request), 0);
+    let outputs = switch.handle(Message::Request(request), 0, None);
     assert_eq!(response_of(&outputs, 481).status, 481);
 }
 
@@ -342,8 +351,8 @@ fn invite_retransmission_repeats_the_last_response() {
         0,
     );
     let alice_invite = invite("1001", "1002", "call-retry");
-    let _ = switch.handle(Message::Request(alice_invite.clone()), 0);
-    let outputs = switch.handle(Message::Request(alice_invite), 500);
+    let _ = switch.handle(Message::Request(alice_invite.clone()), 0, None);
+    let outputs = switch.handle(Message::Request(alice_invite), 500, None);
     assert_eq!(
         response_of(&outputs, 100).status,
         100,

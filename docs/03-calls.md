@@ -81,13 +81,13 @@ to = "reject"
 | --- | --- |
 | `dialed` | Ring the device with the (possibly stripped) dialed number |
 | `reject` | Refuse the call (`403`, logged as `restricted`) |
+| `trunk:<name>` | Send it to another PBX, addressed with the (possibly stripped) number |
 | a number | Ring that specific device |
 
 The callee's number, as the callee sees it, is the *routed* number — routing
 decides identity as well as destination.
 
-Later: ring groups, rules that send a call to a trunk (remote PBX), rules for a
-fax machine on a gateway port.
+Later: ring groups, rules for a fax machine on a gateway port.
 
 ## 5. Hold and transfer (later, not in the first phase)
 

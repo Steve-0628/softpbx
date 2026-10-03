@@ -113,7 +113,8 @@ shaped by **what MikoPBX actually does** (docs/09 §6, captured 2026-10):
 
 **Done when:** site-to-site call scenarios (both directions, busy, no-answer,
 hang-up both sides, lost packets) pass in the DST against a fake remote PBX
-that speaks the captured MikoPBX wire forms.
+that speaks the captured MikoPBX wire forms. ✅ core + scenarios in
+`crates/engine-sim/tests/trunk.rs`; real-peer bring-up is phase 10.
 
 ## Phase 10 — MikoPBX interop (roadmap step 4, part two)
 

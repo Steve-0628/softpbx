@@ -98,11 +98,11 @@ impl Pbx {
                     .remember(branch.to_string(), source);
             }
         }
-        let outputs = self
-            .switch
-            .lock()
-            .expect("lock")
-            .handle(message, self.now_ms());
+        let outputs =
+            self.switch
+                .lock()
+                .expect("lock")
+                .handle(message, self.now_ms(), Some(source));
         self.dispatch(outputs, Some(source)).await;
     }
 

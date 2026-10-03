@@ -15,6 +15,7 @@
 //! ~32 s after the call ends).
 
 use std::collections::{BTreeSet, HashMap};
+use std::net::SocketAddr;
 
 use sip_stack::{
     ack_for_2xx, cseq_parts, make_response, tag_of, uri_of, with_tag, Action, ClientTransaction,
@@ -28,6 +29,16 @@ use crate::routing::{route, Destination, Rule};
 
 /// The methods we implement (docs/07); anything else gets `405` + `Allow`.
 pub const ALLOW: &str = "INVITE, ACK, BYE, CANCEL, REGISTER, OPTIONS";
+
+/// A trunk to another PBX (docs/06 §1): a peer we send calls to and accept
+/// calls from. Identified by its address — no registration involved.
+#[derive(Debug, Clone)]
+pub struct TrunkConfig {
+    /// Label used in routing rules and logs ("mikopbx").
+    pub name: String,
+    /// Where its SIP messages come from, and where we send ours.
+    pub peer: SocketAddr,
+}
 
 /// Everything the switch needs to know from the config file.
 #[derive(Debug, Clone)]
@@ -49,6 +60,8 @@ pub struct SwitchConfig {
     /// Call routing rules, in order (docs/03 §4). Empty = "the dialed number
     /// rings the device that has it".
     pub routing: Vec<Rule>,
+    /// Trunks to other PBXs (docs/06 §1).
+    pub trunks: Vec<TrunkConfig>,
     /// The devices that may register and be called.
     pub devices: Vec<Device>,
 }
@@ -257,14 +270,26 @@ impl Switch {
         outputs
     }
 
-    /// Feeds one incoming SIP message; returns what to send and log.
-    pub fn handle(&mut self, message: Message, now_ms: u64) -> Vec<Output> {
+    /// Feeds one incoming SIP message; returns what to send and log. `from` is
+    /// where the message arrived from (a trunk peer, a phone) — it decides
+    /// admission, and nothing else.
+    pub fn handle(
+        &mut self,
+        message: Message,
+        now_ms: u64,
+        from: Option<SocketAddr>,
+    ) -> Vec<Output> {
         let mut outputs = match message {
-            Message::Request(request) => self.handle_request(request, now_ms),
+            Message::Request(request) => self.handle_request(request, now_ms, from),
             Message::Response(response) => self.handle_response(response, now_ms),
         };
         outputs.extend(self.collect_settled(now_ms));
         outputs
+    }
+
+    /// Whether this address is one of our trunk peers.
+    pub fn is_trunk_peer(&self, address: SocketAddr) -> bool {
+        self.config.trunks.iter().any(|trunk| trunk.peer == address)
     }
 
     /// Runs the final transition on every call that reached `Terminating`.
@@ -278,7 +303,12 @@ impl Switch {
         outputs
     }
 
-    fn handle_request(&mut self, request: Request, now_ms: u64) -> Vec<Output> {
+    fn handle_request(
+        &mut self,
+        request: Request,
+        now_ms: u64,
+        from: Option<SocketAddr>,
+    ) -> Vec<Output> {
         // RFC 3261 §8.2.2.3: never half-implement an extension — anything the
         // request *requires* that we do not implement gets 420 + Unsupported.
         // The same section says Require MUST be *ignored* in ACK and CANCEL;
@@ -317,7 +347,7 @@ impl Switch {
             Method::Invite if self.find_leg(&request).is_some() => {
                 self.handle_reinvite(request, now_ms)
             }
-            Method::Invite => self.handle_invite(request, now_ms),
+            Method::Invite => self.handle_invite(request, now_ms, from),
             Method::Ack => self.handle_ack(request, now_ms),
             Method::Bye => self.handle_bye(request, now_ms),
             Method::Cancel => self.handle_cancel(request, now_ms),
@@ -358,7 +388,12 @@ impl Switch {
 
     // ----- call setup ------------------------------------------------------
 
-    fn handle_invite(&mut self, request: Request, now_ms: u64) -> Vec<Output> {
+    fn handle_invite(
+        &mut self,
+        request: Request,
+        now_ms: u64,
+        from: Option<SocketAddr>,
+    ) -> Vec<Output> {
         let mut outputs = Vec::new();
         let caller_call_id = header(&request.headers, "call-id")
             .unwrap_or("")
@@ -398,8 +433,13 @@ impl Switch {
             return outputs;
         }
 
-        // Only registered devices may place calls (docs/02 §6, docs/07).
-        if !self.registrar.is_registered(&caller_number, now_ms) {
+        // Only registered devices may place calls (docs/02 §6, docs/07) —
+        // except calls from a trunk peer, which is identified by its address
+        // and does not register.
+        let from_trunk = from
+            .map(|address| self.is_trunk_peer(address))
+            .unwrap_or(false);
+        if !from_trunk && !self.registrar.is_registered(&caller_number, now_ms) {
             let response = tagged(make_response(&request, 403, "Forbidden"), &self.fresh_tag());
             let actions = caller_tx.on_response_from_user(response, now_ms);
             push_sends(&mut outputs, actions);
@@ -413,43 +453,78 @@ impl Switch {
             return outputs;
         }
 
-        // Call routing (docs/03 §4): where does this number go?
-        let callee_number = match route(&self.config.routing, &dialed) {
-            Destination::Ring(number) => number,
-            Destination::Reject => {
-                let response = tagged(make_response(&request, 403, "Forbidden"), &self.fresh_tag());
-                let actions = caller_tx.on_response_from_user(response, now_ms);
-                push_sends(&mut outputs, actions);
-                outputs.push(Output::CallLog(call_log_line(
-                    &caller_number,
-                    &dialed,
-                    now_ms,
-                    now_ms,
-                    "restricted",
-                )));
-                return outputs;
-            }
-        };
-
-        // Where does the call go?
-        let Some(callee_contact) = self
-            .registrar
-            .lookup(&callee_number, now_ms)
-            .map(str::to_string)
-        else {
-            let response = tagged(make_response(&request, 404, "Not Found"), &self.fresh_tag());
-            let actions = caller_tx.on_response_from_user(response, now_ms);
-            push_sends(&mut outputs, actions);
-            // Failed calls are logged too: "why didn't my call go through".
-            outputs.push(Output::CallLog(call_log_line(
-                &caller_number,
-                &callee_number,
-                now_ms,
-                now_ms,
-                "not-found",
-            )));
-            return outputs;
-        };
+        // Call routing (docs/03 §4): where does this number go — a device
+        // here, or a number down a trunk to another PBX?
+        let our_domain = self
+            .config
+            .pbx_uri
+            .strip_prefix("sip:")
+            .unwrap_or(&self.config.pbx_uri)
+            .to_string();
+        let (callee_number, callee_contact, callee_domain) =
+            match route(&self.config.routing, &dialed) {
+                Destination::Reject => {
+                    let response =
+                        tagged(make_response(&request, 403, "Forbidden"), &self.fresh_tag());
+                    let actions = caller_tx.on_response_from_user(response, now_ms);
+                    push_sends(&mut outputs, actions);
+                    outputs.push(Output::CallLog(call_log_line(
+                        &caller_number,
+                        &dialed,
+                        now_ms,
+                        now_ms,
+                        "restricted",
+                    )));
+                    return outputs;
+                }
+                Destination::Ring(number) => {
+                    // Where does the call go?
+                    let Some(contact) = self.registrar.lookup(&number, now_ms).map(str::to_string)
+                    else {
+                        let response =
+                            tagged(make_response(&request, 404, "Not Found"), &self.fresh_tag());
+                        let actions = caller_tx.on_response_from_user(response, now_ms);
+                        push_sends(&mut outputs, actions);
+                        // Failed calls are logged too: "why didn't my call go
+                        // through".
+                        outputs.push(Output::CallLog(call_log_line(
+                            &caller_number,
+                            &number,
+                            now_ms,
+                            now_ms,
+                            "not-found",
+                        )));
+                        return outputs;
+                    };
+                    (number, contact, our_domain)
+                }
+                Destination::Trunk(name, number) => {
+                    // Down the trunk: the peer routes the number itself, and
+                    // the number lives in the peer's domain (docs/06 §1).
+                    let Some(trunk) = self.config.trunks.iter().find(|trunk| trunk.name == name)
+                    else {
+                        let response = tagged(
+                            make_response(&request, 503, "Service Unavailable"),
+                            &self.fresh_tag(),
+                        );
+                        let actions = caller_tx.on_response_from_user(response, now_ms);
+                        push_sends(&mut outputs, actions);
+                        outputs.push(Output::CallLog(call_log_line(
+                            &caller_number,
+                            &number,
+                            now_ms,
+                            now_ms,
+                            "unknown-trunk",
+                        )));
+                        return outputs;
+                    };
+                    (
+                        number.clone(),
+                        format!("sip:{number}@{}", trunk.peer.ip()),
+                        trunk.peer.ip().to_string(),
+                    )
+                }
+            };
 
         // RFC 3264 §6: never answer with a codec they did not offer. If the
         // offer shares none of ours, the call cannot carry audio — refuse it
@@ -535,13 +610,7 @@ impl Switch {
 
         // The callee's address of record is the *routed* number, not whatever
         // was dialed (docs/03 §4).
-        let callee_aor = format!(
-            "sip:{callee_number}@{}",
-            self.config
-                .pbx_uri
-                .strip_prefix("sip:")
-                .unwrap_or(&self.config.pbx_uri)
-        );
+        let callee_aor = format!("sip:{callee_number}@{callee_domain}");
 
         // B2BUA: a brand-new leg toward the callee.
         let our_caller_tag = self.fresh_tag();

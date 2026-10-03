@@ -92,6 +92,14 @@ to = "1001"                     # "dialed", "reject", or a number
 match = "9*"
 to = "dialed"
 strip = "9"                     # drop the leading 9 before the lookup
+
+[[routing]]
+match = "3*"                    # 3xxx lives on the other PBX
+to = "trunk:mikopbx"
+
+[[trunk]]
+name = "mikopbx"                # the peer routes the number itself
+peer = "192.168.77.108:5060"
 ```
 
 Ring groups and trunk targets get their own sections here later.
