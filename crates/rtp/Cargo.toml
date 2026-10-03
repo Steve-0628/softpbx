@@ -6,4 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-# tokio に依存しない。生スレッド + socket2/libc で扱う（docs/02 §3）
+# Pure: no I/O, no runtime dependency.
+
+[dev-dependencies]
+proptest = { workspace = true }

@@ -42,6 +42,8 @@ dependencies = [
 name = "call"
 version = "0.1.0"
 dependencies = [
+ "media",
+ "rtp",
  "sip-stack",
  "sip-syntax",
 ]
@@ -77,6 +79,7 @@ name = "engine-sim"
 version = "0.1.0"
 dependencies = [
  "call",
+ "rtp",
  "sip-stack",
  "sip-syntax",
 ]
@@ -162,7 +165,7 @@ dependencies = [
 name = "media"
 version = "0.1.0"
 dependencies = [
- "rtp",
+ "sip-syntax",
 ]
 
 [[package]]
@@ -299,6 +302,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 [[package]]
 name = "rtp"
 version = "0.1.0"
+dependencies = [
+ "proptest",
+]
 
 [[package]]
 name = "rustix"

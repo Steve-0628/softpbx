@@ -11,6 +11,8 @@ fn switch() -> Switch {
         pbx_uri: "sip:192.0.2.10".to_string(),
         pbx_host: "192.0.2.10:5060".to_string(),
         pbx_contact: "<sip:192.0.2.10:5060>".to_string(),
+        rtp_host: "192.0.2.10".to_string(),
+        rtp_port_base: 10_000,
         devices: vec![
             Device {
                 number: "1001".to_string(),

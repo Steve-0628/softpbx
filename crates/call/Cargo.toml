@@ -8,3 +8,5 @@ publish.workspace = true
 [dependencies]
 sip-syntax = { path = "../sip-syntax" }
 sip-stack = { path = "../sip-stack" }
+rtp = { path = "../rtp" }
+media = { path = "../media" }

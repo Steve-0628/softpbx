@@ -13,7 +13,7 @@ use sip_stack::{
     ack_for_non_2xx, make_response, tag_of, uri_of, with_tag, Action, ClientTransaction, Dialog,
     ServerTransaction, Timer,
 };
-use sip_syntax::{canonical_header, Header, Message, Method, Request, Response};
+use sip_syntax::{canonical_header, parse_sdp, Header, Message, Method, Request, Response};
 
 use crate::call::{transit, CallEvent, CallState, Command};
 use crate::registration::{header, number_from_uri, Device, Registrar};
@@ -32,6 +32,10 @@ pub struct SwitchConfig {
     pub pbx_host: String,
     /// Our Contact ("<sip:192.0.2.10:5060>").
     pub pbx_contact: String,
+    /// Our IP, advertised in SDP for media relaying.
+    pub rtp_host: String,
+    /// First UDP port for media relaying; two per call.
+    pub rtp_port_base: u16,
     /// The devices that may register and be called.
     pub devices: Vec<Device>,
 }
@@ -41,6 +45,13 @@ pub struct SwitchConfig {
 pub enum Output {
     /// Send this SIP message.
     Send(Message),
+    /// Send these RTP bytes to `to` ("ip:port") — the transparent pipe.
+    SendRtp {
+        /// Destination address.
+        to: String,
+        /// The exact packet bytes to forward.
+        data: Vec<u8>,
+    },
     /// Append this line to the call log (one per finished call).
     CallLog(String),
 }
@@ -49,6 +60,32 @@ pub enum Output {
 enum Leg {
     Caller,
     Callee,
+}
+
+/// One leg's media relay endpoint.
+#[derive(Debug)]
+struct LegMedia {
+    /// The UDP port we receive this leg's RTP on.
+    our_port: u16,
+    /// Where the leg said its media lives (from its SDP).
+    peer_addr: String,
+    /// Where its packets actually come from (symmetric RTP), when known.
+    learned: Option<String>,
+}
+
+impl LegMedia {
+    fn send_to(&self) -> Option<String> {
+        self.learned
+            .clone()
+            .filter(|address| !address.is_empty())
+            .or_else(|| (!self.peer_addr.is_empty()).then(|| self.peer_addr.clone()))
+    }
+}
+
+#[derive(Debug)]
+struct CallMedia {
+    caller: LegMedia,
+    callee: LegMedia,
 }
 
 #[derive(Debug)]
@@ -62,6 +99,7 @@ struct CallCtx {
     callee_tx: Option<ClientTransaction>,
     callee_invite: Option<Request>,
     callee_dialog: Option<Dialog>,
+    media: Option<CallMedia>,
     started_ms: u64,
     outcome: String,
 }
@@ -94,18 +132,21 @@ pub struct Switch {
     calls: HashMap<String, CallCtx>,
     next_tag: u64,
     next_id: u64,
+    next_rtp_port: u16,
 }
 
 impl Switch {
     /// Creates a switch for the given devices and addresses.
     pub fn new(config: SwitchConfig) -> Self {
         let registrar = Registrar::new(&config.realm, config.devices.clone());
+        let next_rtp_port = config.rtp_port_base;
         Switch {
             config,
             registrar,
             calls: HashMap::new(),
             next_tag: 0,
             next_id: 0,
+            next_rtp_port,
         }
     }
 
@@ -250,10 +291,29 @@ impl Switch {
         };
         let callee_contact = callee_contact.to_string();
 
+        // Media: if the caller offered audio, we relay it (docs/02 §8) and
+        // speak SDP on both legs.
+        let media = media_target(&request.body).map(|peer_addr| CallMedia {
+            caller: LegMedia {
+                our_port: self.allocate_rtp_port(),
+                peer_addr,
+                learned: None,
+            },
+            callee: LegMedia {
+                our_port: self.allocate_rtp_port(),
+                peer_addr: String::new(),
+                learned: None,
+            },
+        });
+        let callee_body = match &media {
+            Some(media) => media::audio_sdp(&self.config.rtp_host, media.callee.our_port),
+            None => Vec::new(),
+        };
+
         // B2BUA: a brand-new leg toward the callee.
         let our_caller_tag = self.fresh_tag();
         let callee_invite =
-            self.build_callee_invite(&request, &caller_uri, &callee_contact, now_ms);
+            self.build_callee_invite(&request, &caller_uri, &callee_contact, callee_body);
         let callee_call_id = header(&callee_invite.headers, "call-id")
             .unwrap_or("")
             .to_string();
@@ -294,6 +354,7 @@ impl Switch {
                 callee_tx: Some(callee_tx),
                 callee_invite: Some(callee_invite),
                 callee_dialog: Some(callee_dialog),
+                media,
                 started_ms: now_ms,
                 outcome: "no-answer".to_string(),
             },
@@ -394,6 +455,38 @@ impl Switch {
         outputs
     }
 
+    /// RTP arrived on one of our relay ports: forward it down the other leg.
+    ///
+    /// The transparent pipe (docs/02 §8): the packet's bytes go out unchanged.
+    /// Garbage in, nothing out.
+    pub fn on_rtp(&mut self, local_port: u16, from: &str, data: &[u8]) -> Vec<Output> {
+        let Ok(packet) = rtp::Packet::parse(data) else {
+            return vec![];
+        };
+        let Some((call_id, leg)) = self.find_media_port(local_port) else {
+            return vec![];
+        };
+        let Some(call) = self.calls.get_mut(&call_id) else {
+            return vec![];
+        };
+        let Some(media) = call.media.as_mut() else {
+            return vec![];
+        };
+        let (source, target) = match leg {
+            Leg::Caller => (&mut media.caller, &media.callee),
+            Leg::Callee => (&mut media.callee, &media.caller),
+        };
+        // Symmetric RTP: whoever speaks is where their media goes back to.
+        source.learned = Some(from.to_string());
+        let Some(to) = target.send_to() else {
+            return vec![]; // the other side has not spoken yet
+        };
+        vec![Output::SendRtp {
+            to,
+            data: packet.to_bytes().to_vec(),
+        }]
+    }
+
     /// Turns transaction actions into outputs and feeds resulting call events
     /// back into the state machine.
     fn apply_actions(&mut self, call_id: &str, actions: Vec<Action>, now_ms: u64) -> Vec<Output> {
@@ -405,6 +498,16 @@ impl Switch {
                     let event = if response.status < 200 {
                         CallEvent::CalleeRinging
                     } else if response.status < 300 {
+                        // Where does the callee's media live?
+                        if let Some(peer_addr) = media_target(&response.body) {
+                            if let Some(media) = self
+                                .calls
+                                .get_mut(call_id)
+                                .and_then(|call| call.media.as_mut())
+                            {
+                                media.callee.peer_addr = peer_addr;
+                            }
+                        }
                         // The dialog layer ACKs the 2xx of our INVITE.
                         if let Some(call) = self.calls.get(call_id) {
                             if let (Some(invite), Some(transaction)) =
@@ -463,6 +566,7 @@ impl Switch {
     fn command_actions(&mut self, call_id: &str, command: Command, now_ms: u64) -> Vec<Action> {
         let via = self.via("bye");
         let contact = self.config.pbx_contact.clone();
+        let rtp_host = self.config.rtp_host.clone();
         let Some(call) = self.calls.get_mut(call_id) else {
             return vec![];
         };
@@ -483,6 +587,13 @@ impl Switch {
                     name: "Contact".to_string(),
                     value: contact,
                 });
+                if let Some(media) = &call.media {
+                    response.headers.push(Header {
+                        name: "Content-Type".to_string(),
+                        value: "application/sdp".to_string(),
+                    });
+                    response.body = media::audio_sdp(&rtp_host, media.caller.our_port);
+                }
                 call.caller_tx.on_response_from_user(response, now_ms)
             }
             Command::FailCaller(status) => {
@@ -563,7 +674,7 @@ impl Switch {
         caller_invite: &Request,
         caller_uri: &str,
         callee_contact: &str,
-        _now_ms: u64,
+        body: Vec<u8>,
     ) -> Request {
         let callee_aor = caller_invite.uri.clone();
         let from_tag = self.fresh_tag();
@@ -599,9 +710,32 @@ impl Switch {
                     name: "Contact".to_string(),
                     value: self.config.pbx_contact.clone(),
                 },
+                Header {
+                    name: "Content-Type".to_string(),
+                    value: "application/sdp".to_string(),
+                },
             ],
-            body: Vec::new(),
+            body,
         }
+    }
+
+    fn find_media_port(&self, local_port: u16) -> Option<(String, Leg)> {
+        self.calls.iter().find_map(|(call_id, call)| {
+            let media = call.media.as_ref()?;
+            if media.caller.our_port == local_port {
+                Some((call_id.clone(), Leg::Caller))
+            } else if media.callee.our_port == local_port {
+                Some((call_id.clone(), Leg::Callee))
+            } else {
+                None
+            }
+        })
+    }
+
+    fn allocate_rtp_port(&mut self) -> u16 {
+        let port = self.next_rtp_port;
+        self.next_rtp_port += 2;
+        port
     }
 
     fn fresh_tag(&mut self) -> String {
@@ -620,6 +754,20 @@ impl Switch {
             self.config.pbx_host, what, self.next_id
         )
     }
+}
+
+/// The media address ("ip:port") an SDP body offers for audio, if any.
+fn media_target(body: &[u8]) -> Option<String> {
+    if body.is_empty() {
+        return None;
+    }
+    let sdp = parse_sdp(body).ok()?;
+    let audio = sdp.media.iter().find(|media| media.media == "audio")?;
+    let connection = audio.connection.as_ref()?;
+    if connection.is_empty() || audio.port == 0 {
+        return None;
+    }
+    Some(format!("{connection}:{}", audio.port))
 }
 
 fn call_log_line(

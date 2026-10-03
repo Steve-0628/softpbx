@@ -26,15 +26,19 @@ pub struct MediaDescription {
     /// Payload type numbers from the format list. Non-numeric format tokens
     /// (e.g. `t38` in `m=image`) are ignored — we only need the numbers.
     pub payload_types: Vec<u8>,
+    /// Connection address (`c=`): media-level if present, else session-level.
+    pub connection: Option<String>,
 }
 
 const MAX_SDP_LINE: usize = 8_192;
 const MAX_MEDIA: usize = 64;
 
-/// Parses an SDP body. Lines that are not `m=` lines are ignored; a malformed
-/// `m=` line is an error.
+/// Parses an SDP body. Lines that are not `m=` (or `c=`) lines are ignored; a
+/// malformed `m=` line is an error.
 pub fn parse_sdp(input: &[u8]) -> Result<Sdp, ParseError> {
     let mut media = Vec::new();
+    let mut session_connection: Option<String> = None;
+    let mut current: Option<MediaDescription> = None;
     let mut rest = input;
     while !rest.is_empty() {
         // A final line without a trailing newline is still a line.
@@ -50,13 +54,37 @@ pub fn parse_sdp(input: &[u8]) -> Result<Sdp, ParseError> {
             return Err(ParseError::LimitExceeded);
         }
         if let Some(fields) = line.strip_prefix(b"m=") {
+            if let Some(description) = current.take() {
+                media.push(description);
+            }
             if media.len() >= MAX_MEDIA {
                 return Err(ParseError::LimitExceeded);
             }
-            media.push(parse_media_line(fields)?);
+            let mut description = parse_media_line(fields)?;
+            description.connection = session_connection.clone();
+            current = Some(description);
+        } else if let Some(fields) = line.strip_prefix(b"c=") {
+            let address = parse_connection_line(fields);
+            match &mut current {
+                Some(description) => description.connection = Some(address),
+                None => session_connection = Some(address),
+            }
         }
     }
+    if let Some(description) = current.take() {
+        media.push(description);
+    }
     Ok(Sdp { media })
+}
+
+/// `c=IN IP4 192.0.2.1` → "192.0.2.1" (the last field).
+fn parse_connection_line(fields: &[u8]) -> String {
+    let line = String::from_utf8_lossy(fields);
+    line.split_whitespace()
+        .last()
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 fn parse_media_line(fields: &[u8]) -> Result<MediaDescription, ParseError> {
@@ -99,5 +127,6 @@ fn parse_media_line(fields: &[u8]) -> Result<MediaDescription, ParseError> {
             .map_err(|_| ParseError::BadHeader)?
             .to_string(),
         payload_types,
+        connection: None,
     })
 }

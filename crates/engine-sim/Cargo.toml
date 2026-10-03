@@ -10,3 +10,4 @@ publish.workspace = true
 sip-syntax = { path = "../sip-syntax" }
 sip-stack = { path = "../sip-stack" }
 call = { path = "../call" }
+rtp = { path = "../rtp" }

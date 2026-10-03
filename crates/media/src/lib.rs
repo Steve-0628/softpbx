@@ -1,87 +1,74 @@
-//! コーデック、DSP（エコー除去・ミキサ）、メディアパイプライン。
+//! Audio handling: G.711 and the SDP we put on the wire (docs/02 §2).
 //!
-//! メディア面（専用スレッド）の心臓部。docs/03 を実装する。
-//!
-//! **鉄則**: オーディオパスでメモリ確保・ロック・ログ出力・ファイル I/O をしない。
+//! Deliberately small. We do not transcode (docs/03 §1: same codec on both
+//! legs wherever possible) and we put no DSP on the forwarded stream
+//! (docs/02 §8) — so this crate is codec *identity* and SDP, not signal
+//! processing. Mixing and transcoding come later, if ever.
 
-/// コーデック。
+/// Codecs we speak (docs/07 SDP subset).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Codec {
-    /// G.711 A-law（FAX/モデムで使用）。
-    Pcma,
-    /// G.711 µ-law（FAX/モデムで使用）。
+    /// G.711 µ-law, payload 0.
     Pcmu,
-    /// G.722（広帯域音声）。
-    G722,
-    /// Opus（`libopus` FFI を想定）。
-    Opus,
+    /// G.711 A-law, payload 8.
+    Pcma,
+    /// RFC 4733 DTMF events, payload 101 (passed through, not interpreted).
+    TelephoneEvent,
 }
 
-/// DSP の設定。VBD（FAX/モデム）中は無効化するものが多い（docs/03 §4）。
-#[derive(Debug, Clone)]
-pub struct DspConfig {
-    /// エコー除去（G.168 相当）。**VBD 中は停止**。
-    pub echo_canceller: bool,
-    /// 活性検出（VAD）。**VBD 中は停止**。
-    pub vad: bool,
-    /// 快適雑音（RFC 3389）。**VBD 中は停止**。
-    pub comfort_noise: bool,
-    /// パケットロス補間（PLC）。**VBD 中は停止**（欠損は復元しない）。
-    pub packet_loss_concealment: bool,
-    /// 自動利得調整。**VBD 中は停止**。
-    pub agc: bool,
-}
-
-impl DspConfig {
-    /// 通常の音声通話用。
-    pub fn voice() -> Self {
-        DspConfig {
-            echo_canceller: true,
-            vad: true,
-            comfort_noise: true,
-            packet_loss_concealment: true,
-            agc: true,
+impl Codec {
+    /// The static payload type number.
+    pub fn payload_type(self) -> u8 {
+        match self {
+            Codec::Pcmu => 0,
+            Codec::Pcma => 8,
+            Codec::TelephoneEvent => 101,
         }
     }
 
-    /// FAX / モデム（VBD）用。信号を壊す処理をすべて止める。
-    pub fn voice_band_data() -> Self {
-        DspConfig {
-            echo_canceller: false,
-            vad: false,
-            comfort_noise: false,
-            packet_loss_concealment: false,
-            agc: false,
+    /// The codec behind a static payload type, if we support it.
+    pub fn of_payload_type(payload_type: u8) -> Option<Codec> {
+        match payload_type {
+            0 => Some(Codec::Pcmu),
+            8 => Some(Codec::Pcma),
+            101 => Some(Codec::TelephoneEvent),
+            _ => None,
+        }
+    }
+
+    /// The `a=rtpmap` line for this codec.
+    pub fn rtpmap(self) -> &'static str {
+        match self {
+            Codec::Pcmu => "a=rtpmap:0 PCMU/8000",
+            Codec::Pcma => "a=rtpmap:8 PCMA/8000",
+            Codec::TelephoneEvent => "a=rtpmap:101 telephone-event/8000",
         }
     }
 }
 
-/// 1 通話分のメディアパイプライン（B2BUA の 1 レグ側）。
-pub struct MediaLeg {
-    /// コーデック。
-    pub codec: Codec,
-    /// DSP 設定。
-    pub dsp: DspConfig,
-}
+/// The codecs we offer, in preference order (G.711 first, as docs/07 says).
+pub const OUR_CODECS: [Codec; 3] = [Codec::Pcmu, Codec::Pcma, Codec::TelephoneEvent];
 
-impl MediaLeg {
-    /// パケット 1 つを処理する。**1ms 以内**（docs/03 §1）。
-    pub fn process(&mut self, _in: &[u8], _out: &mut [u8]) {
-        // TODO(M1): 復号 → DSP → 符号化。同一コーデックなら透過。
-        todo!()
-    }
-}
-
-/// 会議のミキサ（数人〜十数人規模）。
-pub struct Mixer {
-    /// 参加者数。
-    pub participants: usize,
-}
-
-impl Mixer {
-    /// 参加者の音声を合成する。飽和を必ず防ぐ。
-    pub fn mix(&mut self, _inputs: &[&[u8]], _out: &mut [u8]) {
-        // TODO(M1): 固定小数点の整数ミキサ + 飽和処理。
-        todo!()
-    }
+/// Builds the SDP body we send (offer or answer): one audio stream of G.711,
+/// 10 ms packets, no silence suppression.
+pub fn audio_sdp(connection_ip: &str, port: u16) -> Vec<u8> {
+    let payload_types: Vec<String> = OUR_CODECS
+        .iter()
+        .map(|codec| codec.payload_type().to_string())
+        .collect();
+    let rtpmaps: Vec<&str> = OUR_CODECS.iter().map(|codec| codec.rtpmap()).collect();
+    format!(
+        "v=0\r\n\
+         o=softpbx 1 1 IN IP4 {connection_ip}\r\n\
+         s=-\r\n\
+         c=IN IP4 {connection_ip}\r\n\
+         t=0 0\r\n\
+         m=audio {port} RTP/AVP {}\r\n\
+         {}\r\n\
+         a=ptime:10\r\n\
+         a=silenceSupp:off\r\n\r\n",
+        payload_types.join(" "),
+        rtpmaps.join("\r\n"),
+    )
+    .into_bytes()
 }
