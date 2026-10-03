@@ -13,6 +13,7 @@ fn switch() -> Switch {
         pbx_contact: "<sip:192.0.2.10:5060>".to_string(),
         rtp_host: "192.0.2.10".to_string(),
         rtp_port_base: 10_000,
+        rtp_ports: 100,
         devices: vec![
             Device {
                 number: "1001".to_string(),
@@ -211,8 +212,27 @@ fn call_logs(outputs: &[Output]) -> Vec<String> {
 }
 
 #[test]
+fn unregistered_caller_gets_403() {
+    let mut switch = switch();
+    let outputs = switch.handle(Message::Request(invite("6666", "1002", "call-auth")), 0);
+    assert_eq!(
+        response_of(&outputs, 403).status,
+        403,
+        "strangers cannot dial"
+    );
+    assert_eq!(switch.active_calls(), 0);
+}
+
+#[test]
 fn unknown_callee_gets_404() {
     let mut switch = switch();
+    register(
+        &mut switch,
+        "1001",
+        "change-me",
+        "<sip:alice@192.0.2.1:5060>",
+        0,
+    );
     let outputs = switch.handle(Message::Request(invite("1001", "9999", "call-404")), 0);
     assert_eq!(response_of(&outputs, 404).status, 404);
     assert_eq!(switch.active_calls(), 0);
@@ -242,6 +262,13 @@ fn options_is_answered() {
 #[test]
 fn cancel_while_ringing_tears_down_both_legs() {
     let mut switch = switch();
+    register(
+        &mut switch,
+        "1001",
+        "change-me",
+        "<sip:alice@192.0.2.1:5060>",
+        0,
+    );
     register(
         &mut switch,
         "1002",
@@ -299,6 +326,13 @@ fn bye_without_a_call_gets_481() {
 #[test]
 fn invite_retransmission_repeats_the_last_response() {
     let mut switch = switch();
+    register(
+        &mut switch,
+        "1001",
+        "change-me",
+        "<sip:alice@192.0.2.1:5060>",
+        0,
+    );
     register(
         &mut switch,
         "1002",

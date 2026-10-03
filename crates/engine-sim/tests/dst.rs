@@ -67,6 +67,8 @@ fn timer_of(name: &str) -> Timer {
         "H" => Timer::H,
         "I" => Timer::I,
         "J" => Timer::J,
+        "K" => Timer::K,
+        "L" => Timer::L,
         other => panic!("unknown timer {other}"),
     }
 }
@@ -82,6 +84,8 @@ fn name_of(timer: Timer) -> String {
         Timer::H => "H".to_string(),
         Timer::I => "I".to_string(),
         Timer::J => "J".to_string(),
+        Timer::K => "K".to_string(),
+        Timer::L => "L".to_string(),
     }
 }
 

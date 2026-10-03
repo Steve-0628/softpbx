@@ -95,6 +95,10 @@ enum StartLine<'a> {
 
 impl<'a> StartLine<'a> {
     fn parse(line: &'a [u8]) -> Result<Self, ParseError> {
+        // No control bytes anywhere in the start line (kills CR injection).
+        if line.iter().any(|&b| b < 0x20 || b == 0x7f) {
+            return Err(ParseError::BadStartLine);
+        }
         if line.starts_with(b"SIP/") {
             // Response: SIP/2.0 SP status SP reason (reason may be empty).
             let mut fields = line.splitn(3, |&b| b == b' ');

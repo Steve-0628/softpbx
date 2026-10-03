@@ -8,8 +8,10 @@ use anyhow::{bail, Context};
 use call::{Device, SwitchConfig};
 use serde::Deserialize;
 
-/// The whole config file.
+/// The whole config file. Unknown keys are refused: a typo or a section from
+/// an older design must not be silently ignored.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileConfig {
     /// Global settings.
     pub general: General,
@@ -20,6 +22,7 @@ pub struct FileConfig {
 
 /// `[general]`.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct General {
     /// Realm used in digest authentication.
     pub realm: String,
@@ -88,6 +91,9 @@ impl FileConfig {
         if self.general.rtp_port_base == 0 {
             bail!("general.rtp_port_base must not be 0");
         }
+        if u32::from(self.general.rtp_port_base) + u32::from(self.general.rtp_ports) > 65_536 {
+            bail!("general.rtp_port_base + rtp_ports must stay within the port range");
+        }
         if self.device.is_empty() {
             bail!("no [[device]] sections: nothing could register");
         }
@@ -115,6 +121,7 @@ impl FileConfig {
             pbx_contact: format!("<sip:{}>", self.general.pbx_host),
             rtp_host: self.general.rtp_host.clone(),
             rtp_port_base: self.general.rtp_port_base,
+            rtp_ports: self.general.rtp_ports,
             devices: self
                 .device
                 .iter()
@@ -175,7 +182,7 @@ mod tests {
                 &GOOD.replace("rtp_ports = 100", "rtp_ports = 1"),
                 "rtp_ports",
             ),
-            (&GOOD.replace("[[device]]", "[[devices]]"), "no [[device]]"),
+            (&GOOD.replace("[[device]]", "[[devices]]"), "unknown field"),
             (
                 &GOOD.replace("secret = \"change-me\"", "secret = \"\""),
                 "secret",

@@ -11,6 +11,7 @@ mod transaction;
 
 pub use dialog::{tag_of, uri_of, with_tag, Dialog};
 pub use transaction::{
-    ack_for_non_2xx, branch, cseq_parts, make_response, Action, ClientState, ClientTransaction,
-    ServerState, ServerTransaction, Timer, GIVE_UP_MS, T1_MS, T2_MS, T4_MS, TIMER_D_MS,
+    ack_for_2xx, ack_for_non_2xx, branch, cseq_parts, make_response, Action, ClientState,
+    ClientTransaction, ServerState, ServerTransaction, Timer, GIVE_UP_MS, T1_MS, T2_MS, T4_MS,
+    TIMER_D_MS,
 };

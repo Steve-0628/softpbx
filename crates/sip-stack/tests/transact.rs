@@ -3,8 +3,8 @@
 
 use sip_stack::ClientTransaction;
 use sip_stack::{
-    ack_for_non_2xx, make_response, Action, ClientState, ServerState, ServerTransaction, Timer,
-    GIVE_UP_MS, T1_MS, T2_MS, T4_MS, TIMER_D_MS,
+    ack_for_2xx, ack_for_non_2xx, make_response, Action, ClientState, ServerState,
+    ServerTransaction, Timer, GIVE_UP_MS, T1_MS, T2_MS, T4_MS, TIMER_D_MS,
 };
 use sip_syntax::{Header, Message, Method, Request, Response};
 
@@ -207,14 +207,28 @@ fn non_invite_client_times_out_on_f() {
 }
 
 #[test]
-fn non_invite_final_response_terminates() {
+fn non_invite_final_response_completes_then_timer_k() {
     let (mut tx, _) = ClientTransaction::new(request(Method::Options, "z9hG4bK2"), 0);
     let actions = tx.on_response(response(200, "OPTIONS", "z9hG4bK2"), 100);
-    assert!(matches!(
-        actions[..],
-        [Action::DeliverResponse(_), Action::Done]
-    ));
+    assert!(matches!(&actions[..], [Action::DeliverResponse(_)]));
+    assert_eq!(tx.state(), ClientState::Completed);
+    // Timer K (T4) absorbs response retransmissions before ending (§17.1.2.2).
+    assert_eq!(tx.next_timer(), Some((100 + T4_MS, Timer::K)));
+    assert_eq!(tx.on_timer(Timer::K, 100 + T4_MS), vec![Action::Done]);
     assert_eq!(tx.state(), ClientState::Terminated);
+}
+
+#[test]
+fn timer_e_retransmits_in_proceeding_at_t2() {
+    // RFC 3261 §17.1.2.2: a provisional response does NOT stop request
+    // retransmissions; they continue at T2.
+    let (mut tx, _) = ClientTransaction::new(request(Method::Options, "z9hG4bK2"), 0);
+    let _ = tx.on_response(response(100, "OPTIONS", "z9hG4bK2"), 50);
+    assert_eq!(tx.state(), ClientState::Proceeding);
+    assert_eq!(tx.next_timer(), Some((500, Timer::E)));
+    let actions = tx.on_timer(Timer::E, 500);
+    assert!(matches!(&actions[..], [Action::Send(_)]));
+    assert_eq!(tx.next_timer(), Some((500 + T2_MS, Timer::E)));
 }
 
 // ----- server: INVITE -------------------------------------------------------
@@ -272,10 +286,20 @@ fn invite_server_gives_up_without_ack() {
 }
 
 #[test]
-fn invite_server_2xx_terminates_transaction() {
+fn invite_server_2xx_stays_accepted_until_l() {
+    // RFC 6026: the server transaction keeps the 2xx alive so INVITE
+    // retransmissions get it again instead of creating a phantom call.
     let (mut tx, _) = ServerTransaction::new(request(Method::Invite, "z9hG4bK3"), 0);
     let actions = tx.on_response_from_user(response(200, "INVITE", "z9hG4bK3"), 100);
-    assert!(matches!(&actions[..], [Action::Send(_), Action::Done]));
+    assert!(matches!(&actions[..], [Action::Send(_)]));
+    assert_eq!(tx.state(), ServerState::Accepted);
+    assert_eq!(tx.next_timer(), Some((100 + GIVE_UP_MS, Timer::L)));
+
+    // Retransmitted INVITE: repeat the 2xx.
+    let actions = tx.on_request(&request(Method::Invite, "z9hG4bK3"));
+    assert!(matches!(&actions[..], [Action::Send(Message::Response(r))] if r.status == 200));
+
+    assert_eq!(tx.on_timer(Timer::L, 100 + GIVE_UP_MS), vec![Action::Done]);
     assert_eq!(tx.state(), ServerState::Terminated);
 }
 
@@ -321,4 +345,31 @@ fn ack_for_non_2xx_shape() {
         Some("<sip:bob@example.com>;tag=9")
     );
     assert!(ack.body.is_empty());
+}
+
+#[test]
+fn ack_for_2xx_uses_a_new_branch_and_the_remote_target() {
+    // RFC 3261 §13.2.2.4: the 2xx ACK is a new transaction.
+    let invite = request(Method::Invite, "z9hG4bK5");
+    let mut ok = response(200, "INVITE", "z9hG4bK5");
+    ok.headers[2].value = "<sip:bob@example.com>;tag=9".to_string();
+    ok.headers.push(Header {
+        name: "Contact".to_string(),
+        value: "<sip:bob@192.0.2.2:5060>".to_string(),
+    });
+    let ack = ack_for_2xx(
+        &invite,
+        &ok,
+        "SIP/2.0/UDP pbx:5060;branch=z9hG4bK-new",
+        "<sip:pbx:5060>",
+    );
+
+    assert_eq!(ack.method, Method::Ack);
+    assert_eq!(ack.uri, "sip:bob@192.0.2.2:5060", "goes to their Contact");
+    assert_eq!(
+        value(&ack.headers, "via"),
+        Some("SIP/2.0/UDP pbx:5060;branch=z9hG4bK-new"),
+        "fresh branch, not the INVITE's"
+    );
+    assert_eq!(value(&ack.headers, "cseq"), Some("1 ACK"));
 }

@@ -192,6 +192,29 @@ fn missing_authorization_is_challenged() {
 }
 
 #[test]
+fn display_names_in_to_are_fine() {
+    // Real phones send `To: "Alice" <sip:1001@...>` (docs/09 finding).
+    let mut registrar = registrar();
+    let mut request = register("1001", "<sip:alice@192.0.2.1:5060>", None, None);
+    request.headers[2].value = "\"Alice\" <sip:1001@192.0.2.10>".to_string();
+    let response = registrar.handle_register(&request, 0);
+    assert_eq!(response.status, 401, "recognized as 1001 and challenged");
+}
+
+#[test]
+fn nonces_we_never_issued_are_refused() {
+    // Replay protection: a sniffed response over an unknown nonce is useless.
+    let mut registrar = registrar();
+    let stale = authorize("1001", "change-me", "0000-never-issued", "REGISTER");
+    let response = registrar.handle_register(
+        &register("1001", "<sip:mallory@192.0.2.66:5060>", None, Some(stale)),
+        0,
+    );
+    assert_eq!(response.status, 401, "replayed authorization is refused");
+    assert!(registrar.lookup("1001", 0).is_none());
+}
+
+#[test]
 fn unknown_number_is_forbidden() {
     let mut registrar = registrar();
     let response = registrar.handle_register(&register("9999", "<sip:x@192.0.2.1>", None, None), 0);

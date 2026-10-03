@@ -26,6 +26,10 @@ const PBX_HOST: &str = "192.0.2.10:5060";
 const PBX_CONTACT: &str = "<sip:192.0.2.10:5060>";
 
 fn switch_with(devices: Vec<Device>) -> Switch {
+    switch_with_ports(devices, 100)
+}
+
+fn switch_with_ports(devices: Vec<Device>, rtp_ports: u16) -> Switch {
     Switch::new(SwitchConfig {
         realm: REALM.to_string(),
         pbx_uri: PBX_URI.to_string(),
@@ -33,6 +37,7 @@ fn switch_with(devices: Vec<Device>) -> Switch {
         pbx_contact: PBX_CONTACT.to_string(),
         rtp_host: "192.0.2.10".to_string(),
         rtp_port_base: 10_000,
+        rtp_ports,
         devices,
     })
 }
@@ -309,6 +314,12 @@ struct CallSetup {
     callee_relay_port: u16,
     caller_media: String,
     callee_media: String,
+    /// The callee leg's own Call-ID (B2BUA).
+    callee_call_id: String,
+    /// Our tag on the callee leg (their To-tag).
+    our_callee_tag: String,
+    /// The callee's tag on their leg.
+    callee_tag: String,
 }
 
 /// Full call setup: INVITE → ring → answer → ACK, with media on both legs.
@@ -360,6 +371,13 @@ fn establish_call(
     assert!(outputs.is_empty(), "the ACK needs no answer");
     assert_eq!(switch.call_state(call_id), Some(CallState::Answered));
 
+    let callee_call_id = header_value(&callee_invite.headers, "call-id")
+        .expect("callee call-id")
+        .to_string();
+    let our_callee_tag = tag_of(header_value(&callee_invite.headers, "from").unwrap())
+        .expect("our callee tag")
+        .to_string();
+
     CallSetup {
         call_id: call_id.to_string(),
         to_tag,
@@ -367,6 +385,9 @@ fn establish_call(
         callee_relay_port,
         caller_media: caller_media.to_string(),
         callee_media: callee_media.to_string(),
+        callee_call_id,
+        our_callee_tag,
+        callee_tag: "bob1".to_string(),
     }
 }
 
@@ -506,6 +527,13 @@ fn ac02_no_answer_gives_up() {
     register_device(
         &mut world,
         &mut switch,
+        "1001",
+        "change-me",
+        "<sip:alice@192.0.2.1:5060>",
+    );
+    register_device(
+        &mut world,
+        &mut switch,
         "1002",
         "bob-secret",
         "<sip:bob@192.0.2.2:5060>",
@@ -543,12 +571,15 @@ fn ac02_no_answer_gives_up() {
         }
     }
 
-    assert_eq!(
-        caller_responses,
-        vec![408],
-        "the caller is told it timed out"
+    assert!(
+        !caller_responses.is_empty() && caller_responses.iter().all(|&status| status == 408),
+        "the caller is told it timed out (and only that): {caller_responses:?}"
     );
-    assert_eq!(logs.len(), 1);
+    assert_eq!(
+        logs.len(),
+        1,
+        "one log line however often 408 is retransmitted"
+    );
     assert!(logs[0].contains("\"result\":\"no-answer\""), "{}", logs[0]);
     assert_eq!(switch.active_calls(), 0);
 }
@@ -829,4 +860,530 @@ fn call_scenario_is_deterministic() {
         world.trace().to_vec()
     }
     assert_eq!(run(), run());
+}
+
+// ----- regressions (bugs the reviews and the softphones found) --------------
+
+/// The callee's BYE tears the call down too (it used to get 481 forever).
+#[test]
+fn regression_callee_bye_tears_down() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let call = establish_call(
+        &mut world,
+        &mut switch,
+        "reg-callee-bye",
+        "1001",
+        "1002",
+        "192.0.2.1:10000",
+        "192.0.2.2:20000",
+    );
+
+    // Bob hangs up first: BYE on the callee leg.
+    let outputs = feed(&mut world, &mut switch, &callee_bye_bytes(&call));
+    assert_eq!(
+        response_of(&outputs, 200).status,
+        200,
+        "his BYE is answered: {outputs:?}"
+    );
+    assert_eq!(
+        request_of(&outputs, Method::Bye).method,
+        Method::Bye,
+        "Alice gets a BYE too"
+    );
+    let logs = call_logs(&outputs);
+    assert_eq!(logs.len(), 1, "{logs:?}");
+    assert!(logs[0].contains("\"result\":\"completed\""), "{}", logs[0]);
+    assert_eq!(switch.active_calls(), 0, "the call is gone");
+}
+
+/// A mid-call re-INVITE is answered with the session unchanged (never a 404).
+#[test]
+fn regression_reinvite_is_answered() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let call = establish_call(
+        &mut world,
+        &mut switch,
+        "reg-reinvite",
+        "1001",
+        "1002",
+        "192.0.2.1:10000",
+        "192.0.2.2:20000",
+    );
+
+    // Caller leg: session refresh.
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &reinvite_bytes(
+            &call.call_id,
+            "1001",
+            "from1",
+            &call.to_tag,
+            2,
+            "192.0.2.1:10000",
+        ),
+    );
+    let response = response_of(&outputs, 200);
+    assert!(
+        !response.body.is_empty(),
+        "answered with our SDP: {outputs:?}"
+    );
+
+    // Callee leg: renegotiation attempt.
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &reinvite_bytes(
+            &call.callee_call_id,
+            "1002",
+            &call.callee_tag,
+            &call.our_callee_tag,
+            2,
+            "192.0.2.2:20000",
+        ),
+    );
+    assert_eq!(
+        response_of(&outputs, 200).status,
+        200,
+        "callee-leg re-INVITE answered: {outputs:?}"
+    );
+    assert_eq!(switch.active_calls(), 1, "still exactly one call");
+    assert_eq!(switch.call_state(&call.call_id), Some(CallState::Answered));
+}
+
+/// A BYE before the call is answered tears everything down (RFC 3261 §15).
+#[test]
+fn regression_early_bye_tears_down() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite_bytes("1001", "1002", "reg-early-bye", "192.0.2.1:10000"),
+    );
+    let callee_invite = request_of(&outputs, Method::Invite);
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(&callee_invite, 180, "Ringing", "bob1", b""),
+    );
+    let ringing = response_of(&outputs, 180);
+
+    // Alice gives up before Bob answers.
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &bye_bytes(
+            "1001",
+            "sip:192.0.2.10:5060",
+            tag_of(header_value(&ringing.headers, "to").unwrap()).unwrap(),
+            "reg-early-bye",
+            2,
+        ),
+    );
+    assert_eq!(
+        response_of(&outputs, 200).status,
+        200,
+        "the BYE is answered"
+    );
+    assert_eq!(
+        response_of(&outputs, 487).status,
+        487,
+        "our INVITE is terminated"
+    );
+    assert_eq!(
+        requests_of(&outputs, Method::Cancel).len(),
+        1,
+        "the callee leg is cancelled"
+    );
+    let logs = call_logs(&outputs);
+    assert!(logs[0].contains("\"result\":\"cancelled\""), "{}", logs[0]);
+    assert_eq!(switch.active_calls(), 0);
+}
+
+/// A retransmitted INVITE after the answer repeats the 200 — it must NOT
+/// ring the callee again (the phantom-call bug).
+#[test]
+fn regression_retransmitted_invite_repeats_200() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let setup = establish_call(
+        &mut world,
+        &mut switch,
+        "reg-invite-retry",
+        "1001",
+        "1002",
+        "192.0.2.1:10000",
+        "192.0.2.2:20000",
+    );
+
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite_bytes("1001", "1002", "reg-invite-retry", "192.0.2.1:10000"),
+    );
+    assert_eq!(
+        response_of(&outputs, 200).status,
+        200,
+        "our 200 goes out again: {outputs:?}"
+    );
+    assert!(
+        requests_of(&outputs, Method::Invite).is_empty(),
+        "and the callee is NOT rung again"
+    );
+    assert_eq!(switch.active_calls(), 1);
+    assert_eq!(switch.call_state(&setup.call_id), Some(CallState::Answered));
+}
+
+/// A retransmitted 2xx from the callee gets our ACK again.
+#[test]
+fn regression_retransmitted_2xx_gets_reacked() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite_bytes("1001", "1002", "reg-2xx-retry", "192.0.2.1:10000"),
+    );
+    let callee_invite = request_of(&outputs, Method::Invite);
+    let _ = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(&callee_invite, 180, "Ringing", "bob1", b""),
+    );
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(
+            &callee_invite,
+            200,
+            "OK",
+            "bob1",
+            &sdp_body("192.0.2.2:20000"),
+        ),
+    );
+    let answered = response_of(&outputs, 200);
+    let to_tag = tag_of(header_value(&answered.headers, "to").unwrap()).unwrap();
+    let _ = feed(
+        &mut world,
+        &mut switch,
+        &ack_bytes("reg-2xx-retry", "1001", "1002", to_tag),
+    );
+
+    // Bob's 200 is retransmitted (our ACK may have been lost).
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(
+            &callee_invite,
+            200,
+            "OK",
+            "bob1",
+            &sdp_body("192.0.2.2:20000"),
+        ),
+    );
+    assert_eq!(
+        requests_of(&outputs, Method::Ack).len(),
+        1,
+        "the 2xx is ACKed again: {outputs:?}"
+    );
+}
+
+/// After a CANCEL, the callee's 487 is ACKed (it used to be ignored for 32 s).
+#[test]
+fn regression_cancel_487_is_acked_at_callee() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite_bytes("1001", "1002", "reg-cancel", "192.0.2.1:10000"),
+    );
+    let callee_invite = request_of(&outputs, Method::Invite);
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(&callee_invite, 180, "Ringing", "bob1", b""),
+    );
+    let ringing = response_of(&outputs, 180);
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &cancel_bytes(
+            "1001",
+            "reg-cancel",
+            tag_of(header_value(&ringing.headers, "to").unwrap()).unwrap(),
+        ),
+    );
+    assert_eq!(
+        requests_of(&outputs, Method::Cancel).len(),
+        1,
+        "cancels the leg"
+    );
+
+    // The callee answers the CANCEL with 487 for the INVITE — we must ACK it.
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(&callee_invite, 487, "Request Terminated", "bob1", b""),
+    );
+    assert_eq!(
+        requests_of(&outputs, Method::Ack).len(),
+        1,
+        "the 487 is ACKed: {outputs:?}"
+    );
+}
+
+/// Call-IDs containing ':' used to kill every transaction timer.
+#[test]
+fn regression_call_id_with_colon_still_times_out() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+
+    let _ = feed(
+        &mut world,
+        &mut switch,
+        &invite_bytes("1001", "1002", "call:with:colons", "192.0.2.1:10000"),
+    );
+    let mut got_408 = false;
+    loop {
+        let timers = switch.timers();
+        if timers.is_empty() {
+            break;
+        }
+        for (name, due) in timers {
+            world.arm(name, due);
+        }
+        while let Some(event) = world.next_event() {
+            if let Event::Timer { name } = event {
+                for output in switch.on_timer(&name, world.now_ms()) {
+                    if let Output::Send(Message::Response(response)) = output {
+                        if response.status == 408 {
+                            got_408 = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(got_408, "timers must fire even for colon-heavy Call-IDs");
+}
+
+/// Media ports return to the pool when calls end.
+#[test]
+fn regression_rtp_ports_are_recycled() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch_with_ports(phones(), 4); // room for two calls
+    register_both(&mut world, &mut switch);
+
+    for round in 0..3u16 {
+        let call = establish_call(
+            &mut world,
+            &mut switch,
+            &format!("reg-ports-{round}"),
+            "1001",
+            "1002",
+            &format!("192.0.2.1:{}", 10000 + round),
+            &format!("192.0.2.2:{}", 20000 + round),
+        );
+        assert_ne!(call.caller_relay_port, call.callee_relay_port);
+        let _ = feed(
+            &mut world,
+            &mut switch,
+            &bye_bytes(
+                "1001",
+                "sip:192.0.2.10:5060",
+                &call.to_tag,
+                &call.call_id,
+                2,
+            ),
+        );
+        assert_eq!(switch.active_calls(), 0);
+    }
+}
+
+/// With the pool exhausted, new calls get 503 instead of silent dead audio.
+#[test]
+fn regression_media_exhaustion_gives_503() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch_with_ports(phones(), 4); // room for two calls
+    register_both(&mut world, &mut switch);
+
+    let _ = establish_call(
+        &mut world,
+        &mut switch,
+        "reg-full-1",
+        "1001",
+        "1002",
+        "192.0.2.1:10000",
+        "192.0.2.2:20000",
+    );
+    let _ = establish_call(
+        &mut world,
+        &mut switch,
+        "reg-full-2",
+        "1001",
+        "1002",
+        "192.0.2.1:10002",
+        "192.0.2.2:20002",
+    );
+
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite_bytes("1001", "1002", "reg-full-3", "192.0.2.1:10004"),
+    );
+    assert_eq!(
+        response_of(&outputs, 503).status,
+        503,
+        "out of media ports: {outputs:?}"
+    );
+    let logs = call_logs(&outputs);
+    assert!(logs[0].contains("\"result\":\"no-media\""), "{}", logs[0]);
+}
+
+/// A 100 Trying from the callee is hop-by-hop: the caller never sees it.
+#[test]
+fn regression_100_trying_is_not_forwarded() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite_bytes("1001", "1002", "reg-100", "192.0.2.1:10000"),
+    );
+    let callee_invite = request_of(&outputs, Method::Invite);
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(&callee_invite, 100, "Trying", "", b""),
+    );
+    assert!(
+        response_of_maybe(&outputs, 100).is_none(),
+        "100 is not forwarded: {outputs:?}"
+    );
+}
+
+// ----- helpers for the regressions ------------------------------------------
+
+fn phones() -> Vec<Device> {
+    vec![
+        Device {
+            number: "1001".to_string(),
+            name: "Alice".to_string(),
+            secret: "change-me".to_string(),
+        },
+        Device {
+            number: "1002".to_string(),
+            name: "Bob".to_string(),
+            secret: "bob-secret".to_string(),
+        },
+    ]
+}
+
+fn register_both(world: &mut World, switch: &mut Switch) {
+    register_device(
+        world,
+        switch,
+        "1001",
+        "change-me",
+        "<sip:alice@192.0.2.1:5060>",
+    );
+    register_device(
+        world,
+        switch,
+        "1002",
+        "bob-secret",
+        "<sip:bob@192.0.2.2:5060>",
+    );
+}
+
+fn response_of_maybe(outputs: &[Output], status: u16) -> Option<Response> {
+    outputs.iter().find_map(|output| match output {
+        Output::Send(Message::Response(response)) if response.status == status => {
+            Some(response.clone())
+        }
+        _ => None,
+    })
+}
+
+fn requests_of(outputs: &[Output], method: Method) -> Vec<Request> {
+    outputs
+        .iter()
+        .filter_map(|output| match output {
+            Output::Send(Message::Request(request)) if request.method == method => {
+                Some(request.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// BYE from the callee side (their tag on From, our callee tag on To).
+fn callee_bye_bytes(call: &CallSetup) -> Vec<u8> {
+    format!(
+        "BYE {PBX_URI} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 192.0.2.2:5060;branch=z9hG4bK-callee-bye\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:1002@192.0.2.10>;tag={}\r\n\
+         To: <sip:1001@192.0.2.10>;tag={}\r\n\
+         Call-ID: {}\r\n\
+         CSeq: 2 BYE\r\n\
+         Content-Length: 0\r\n\r\n",
+        call.callee_tag, call.our_callee_tag, call.callee_call_id
+    )
+    .into_bytes()
+}
+
+/// An in-dialog re-INVITE (session refresh) from either side.
+fn reinvite_bytes(
+    call_id: &str,
+    from: &str,
+    from_tag: &str,
+    to_tag: &str,
+    cseq: u32,
+    media: &str,
+) -> Vec<u8> {
+    let body = sdp_body(media);
+    let mut text = format!(
+        "INVITE {PBX_URI} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-reinvite-{call_id}\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:{from}@192.0.2.10>;tag={from_tag}\r\n\
+         To: <sip:1002@192.0.2.10>;tag={to_tag}\r\n\
+         Call-ID: {call_id}\r\n\
+         CSeq: {cseq} INVITE\r\n\
+         Contact: <sip:{from}@192.0.2.1:5060>\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: {}\r\n\r\n",
+        body.len()
+    );
+    text.push_str(&String::from_utf8(body).unwrap());
+    text.into_bytes()
+}
+
+/// CANCEL from the caller for a ringing INVITE.
+fn cancel_bytes(from: &str, call_id: &str, to_tag: &str) -> Vec<u8> {
+    format!(
+        "CANCEL sip:{PBX_URI} SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-{call_id}\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:{from}@192.0.2.10>;tag=from1\r\n\
+         To: <sip:1002@192.0.2.10>;tag={to_tag}\r\n\
+         Call-ID: {call_id}\r\n\
+         CSeq: 1 CANCEL\r\n\
+         Content-Length: 0\r\n\r\n"
+    )
+    .into_bytes()
 }

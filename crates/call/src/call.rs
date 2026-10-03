@@ -10,21 +10,21 @@
 pub enum CallState {
     /// INVITE received; deciding where it goes.
     Offering,
-    /// The callee is ringing.
+    /// The callee is being alerted.
     Ringing,
     /// The call is up.
     Answered,
     /// Teardown messages are going out.
     Terminating,
-    /// Done.
+    /// Done (kept around only until its transactions finish).
     Terminated,
 }
 
 /// What happened to a call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallEvent {
-    /// The callee leg got a provisional response.
-    CalleeRinging,
+    /// The callee leg got a provisional response (180, 183, ...).
+    CalleeProgress(u16),
     /// The callee answered.
     CalleeAnswered,
     /// The callee leg got a final non-2xx response (busy, refused, ...).
@@ -33,9 +33,9 @@ pub enum CallEvent {
     CalleeTimeout,
     /// The caller cancelled while the call was still being set up.
     CallerCancelled,
-    /// The caller hung up an answered call.
+    /// The caller sent BYE.
     CallerHungUp,
-    /// The callee hung up an answered call.
+    /// The callee sent BYE.
     CalleeHungUp,
     /// The teardown messages are out; the call is over.
     Teardown,
@@ -44,8 +44,8 @@ pub enum CallEvent {
 /// What the environment must do about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
-    /// Tell the caller the callee is ringing.
-    RingCaller,
+    /// Tell the caller the call is making progress, with this code (180, 183).
+    ProgressCaller(u16),
     /// Tell the caller the call is answered.
     AnswerCaller,
     /// Tell the caller the call failed with this status.
@@ -69,9 +69,10 @@ pub fn transit(state: CallState, event: CallEvent) -> (CallState, Vec<Command>) 
     use CallEvent::*;
     use CallState::*;
     match (state, event) {
-        (Offering, CalleeRinging) => (Ringing, vec![Command::RingCaller]),
-        (Offering, CalleeAnswered) => (Answered, vec![Command::AnswerCaller]),
-        (Ringing, CalleeAnswered) => (Answered, vec![Command::AnswerCaller]),
+        (Offering | Ringing, CalleeProgress(code)) => {
+            (Ringing, vec![Command::ProgressCaller(code)])
+        }
+        (Offering | Ringing, CalleeAnswered) => (Answered, vec![Command::AnswerCaller]),
 
         (Offering | Ringing, CalleeRejected(status)) => {
             (Terminating, vec![Command::FailCaller(status)])
@@ -79,6 +80,16 @@ pub fn transit(state: CallState, event: CallEvent) -> (CallState, Vec<Command>) 
         (Offering | Ringing, CalleeTimeout) => (Terminating, vec![Command::FailCaller(408)]),
         (Offering | Ringing, CallerCancelled) => (Terminating, vec![Command::CancelCaller]),
 
+        // A BYE means "I want out", whatever state we are in (RFC 3261 §15):
+        // tear down both sides.
+        (Offering | Ringing, CallerHungUp) => (
+            Terminating,
+            vec![Command::CancelCaller, Command::CompleteCaller],
+        ),
+        (Offering | Ringing, CalleeHungUp) => (
+            Terminating,
+            vec![Command::FailCaller(487), Command::CompleteCallee],
+        ),
         (Answered, CallerHungUp) => (
             Terminating,
             vec![Command::ByeCallee, Command::CompleteCaller],

@@ -56,10 +56,12 @@ impl Pbx {
         };
         if let Message::Request(request) = &message {
             if let Some(branch) = sip_stack::branch(&request.headers) {
-                self.response_route
-                    .lock()
-                    .expect("lock")
-                    .insert(branch.to_string(), source);
+                let mut routes = self.response_route.lock().expect("lock");
+                // Bounded: old branches only matter for one transaction.
+                if routes.len() > 4_096 {
+                    routes.clear();
+                }
+                routes.insert(branch.to_string(), source);
             }
         }
         let outputs = self

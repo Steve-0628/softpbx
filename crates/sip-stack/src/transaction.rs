@@ -27,7 +27,7 @@ pub const GIVE_UP_MS: u64 = 64 * T1_MS;
 /// non-2xx final response.
 pub const TIMER_D_MS: u64 = 32_000;
 
-/// RFC 3261 §17 timers.
+/// RFC 3261 §17 timers (plus RFC 6026 Timer L).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Timer {
     /// INVITE client: retransmit request (T1 doubling).
@@ -48,6 +48,10 @@ pub enum Timer {
     I,
     /// Non-INVITE server: wait after final response (64·T1).
     J,
+    /// Non-INVITE client: absorb response retransmissions after Completed (T4).
+    K,
+    /// INVITE server (RFC 6026): wait after sending a 2xx (64·T1).
+    L,
 }
 
 /// What the caller must do on behalf of a transaction.
@@ -89,6 +93,9 @@ pub enum ServerState {
     Proceeding,
     /// Final response sent; retransmitting it (INVITE) or waiting out Timer J.
     Completed,
+    /// 2xx sent for an INVITE (RFC 6026): retransmit it on request
+    /// retransmissions until Timer L expires.
+    Accepted,
     /// ACK received (INVITE, non-2xx); waiting out Timer I.
     Confirmed,
     /// Done.
@@ -104,7 +111,8 @@ pub struct ClientTransaction {
     started_ms: u64,
     retransmit_next_ms: u64,
     retransmit_interval_ms: u64,
-    timer_d_ms: Option<u64>,
+    /// When "Completed" ends: Timer D (INVITE) or Timer K (non-INVITE).
+    completed_timer: Option<(u64, Timer)>,
     last_ack: Option<Request>,
 }
 
@@ -124,7 +132,7 @@ impl ClientTransaction {
             started_ms: now_ms,
             retransmit_next_ms: now_ms + T1_MS,
             retransmit_interval_ms: T1_MS,
-            timer_d_ms: None,
+            completed_timer: None,
             last_ack: None,
         };
         (transaction, vec![Action::Send(Message::Request(request))])
@@ -133,6 +141,11 @@ impl ClientTransaction {
     /// Current state.
     pub fn state(&self) -> ClientState {
         self.state
+    }
+
+    /// Whether this transaction is completely done (safe to drop).
+    pub fn is_finished(&self) -> bool {
+        self.state == ClientState::Terminated
     }
 
     /// Whether this transaction carries an INVITE.
@@ -151,14 +164,18 @@ impl ClientTransaction {
                 (self.retransmit_next_ms, Timer::A),
                 (give_up, Timer::B),
             )),
+            // Timer E keeps retransmitting in "Proceeding", at T2
+            // (RFC 3261 §17.1.2.2).
             ClientState::Trying => Some(earliest(
                 (self.retransmit_next_ms, Timer::E),
                 (give_up, Timer::F),
             )),
-            ClientState::Proceeding => {
-                Some((give_up, if self.invite { Timer::B } else { Timer::F }))
-            }
-            ClientState::Completed => self.timer_d_ms.map(|due| (due, Timer::D)),
+            ClientState::Proceeding if !self.invite => Some(earliest(
+                (self.retransmit_next_ms, Timer::E),
+                (give_up, Timer::F),
+            )),
+            ClientState::Proceeding => Some((give_up, Timer::B)),
+            ClientState::Completed => self.completed_timer,
             ClientState::Terminated => None,
         }
     }
@@ -201,6 +218,13 @@ impl ClientTransaction {
                 self.retransmit_next_ms = now_ms + self.retransmit_interval_ms;
                 vec![Action::Send(Message::Request(self.request.clone()))]
             }
+            // In "Proceeding" the request is still retransmitted, now at T2
+            // (RFC 3261 §17.1.2.2).
+            (ClientState::Proceeding, Timer::E) if !self.invite => {
+                self.retransmit_interval_ms = T2_MS;
+                self.retransmit_next_ms = now_ms + T2_MS;
+                vec![Action::Send(Message::Request(self.request.clone()))]
+            }
             (ClientState::Calling, Timer::B) | (ClientState::Proceeding, Timer::B)
                 if self.invite =>
             {
@@ -213,7 +237,7 @@ impl ClientTransaction {
                 self.state = ClientState::Terminated;
                 vec![Action::Timeout, Action::Done]
             }
-            (ClientState::Completed, Timer::D) => {
+            (ClientState::Completed, Timer::D | Timer::K) => {
                 self.state = ClientState::Terminated;
                 vec![Action::Done]
             }
@@ -247,8 +271,10 @@ impl ClientTransaction {
 
     fn finish(&mut self, response: Response, now_ms: u64) -> Vec<Action> {
         if !self.invite {
-            self.state = ClientState::Terminated;
-            return vec![Action::DeliverResponse(response), Action::Done];
+            // Completed absorbs response retransmissions until Timer K (T4).
+            self.state = ClientState::Completed;
+            self.completed_timer = Some((now_ms + T4_MS, Timer::K));
+            return vec![Action::DeliverResponse(response)];
         }
         if response.status < 300 {
             // 2xx: the dialog layer takes over (it sends the ACK).
@@ -258,7 +284,7 @@ impl ClientTransaction {
         let ack = ack_for_non_2xx(&self.request, &response);
         self.last_ack = Some(ack.clone());
         self.state = ClientState::Completed;
-        self.timer_d_ms = Some(now_ms + TIMER_D_MS);
+        self.completed_timer = Some((now_ms + TIMER_D_MS, Timer::D));
         vec![
             Action::Send(Message::Request(ack)),
             Action::DeliverResponse(response),
@@ -340,9 +366,17 @@ impl ServerTransaction {
                 (self.give_up_ms, Timer::H),
             )),
             ServerState::Completed => Some((self.give_up_ms, Timer::J)),
+            // RFC 6026: a sent 2xx is retransmitted on request
+            // retransmissions until Timer L expires.
+            ServerState::Accepted => Some((self.give_up_ms, Timer::L)),
             ServerState::Confirmed => self.confirmed_ms.map(|due| (due, Timer::I)),
             _ => None,
         }
+    }
+
+    /// Whether this transaction is completely done (safe to drop).
+    pub fn is_finished(&self) -> bool {
+        self.state == ServerState::Terminated
     }
 
     /// The call layer decided on a response; send it and update state.
@@ -350,7 +384,7 @@ impl ServerTransaction {
     /// Ignored once the transaction is over (`Terminated`) or the call is
     /// confirmed (`Confirmed`): a finished transaction stays finished.
     pub fn on_response_from_user(&mut self, response: Response, now_ms: u64) -> Vec<Action> {
-        if matches!(self.state, ServerState::Terminated | ServerState::Confirmed) {
+        if !matches!(self.state, ServerState::Trying | ServerState::Proceeding) {
             return vec![];
         }
         match (self.invite, response.status) {
@@ -360,10 +394,13 @@ impl ServerTransaction {
                 vec![Action::Send(Message::Response(response))]
             }
             (true, status) if status < 300 => {
-                // 2xx retransmission is the dialog layer's job (RFC 6026).
-                self.state = ServerState::Terminated;
+                // RFC 6026: the server transaction stays in "Accepted" and
+                // retransmits the 2xx on request retransmissions until
+                // Timer L; the dialog layer owns the ACK.
+                self.state = ServerState::Accepted;
                 self.last_response = Some(response.clone());
-                vec![Action::Send(Message::Response(response)), Action::Done]
+                self.give_up_ms = now_ms + GIVE_UP_MS;
+                vec![Action::Send(Message::Response(response))]
             }
             (true, _) => {
                 self.state = ServerState::Completed;
@@ -395,8 +432,10 @@ impl ServerTransaction {
         }
         let retransmit = matches!(
             (self.invite, self.state),
-            (true, ServerState::Proceeding | ServerState::Completed)
-                | (false, ServerState::Proceeding | ServerState::Completed)
+            (
+                true,
+                ServerState::Proceeding | ServerState::Completed | ServerState::Accepted
+            ) | (false, ServerState::Proceeding | ServerState::Completed)
         );
         match (&retransmit, &self.last_response) {
             (true, Some(response)) => vec![Action::Send(Message::Response(response.clone()))],
@@ -429,6 +468,10 @@ impl ServerTransaction {
                 self.state = ServerState::Terminated;
                 vec![Action::Done]
             }
+            (ServerState::Accepted, Timer::L) => {
+                self.state = ServerState::Terminated;
+                vec![Action::Done]
+            }
             (ServerState::Confirmed, Timer::I) => {
                 self.state = ServerState::Terminated;
                 vec![Action::Done]
@@ -439,6 +482,11 @@ impl ServerTransaction {
             }
             _ => vec![],
         }
+    }
+
+    /// The branch this transaction is identified by.
+    pub fn branch(&self) -> Option<&str> {
+        branch(&self.request.headers)
     }
 
     /// Whether this request is a retransmission of ours (Via branch + method).
@@ -504,6 +552,59 @@ pub fn ack_for_non_2xx(invite: &Request, response: &Response) -> Request {
     Request {
         method: Method::Ack,
         uri: invite.uri.clone(),
+        headers,
+        body: Vec::new(),
+    }
+}
+
+/// Builds the ACK for a 2xx response to our INVITE (RFC 3261 §13.2.2.4).
+/// This ACK starts a new transaction, so it gets a **fresh Via branch** (the
+/// caller supplies the Via), and it goes to the remote target (the response's
+/// Contact) — not back to the INVITE's request-URI. CSeq keeps the INVITE's
+/// number with method ACK.
+pub fn ack_for_2xx(invite: &Request, response: &Response, via: &str, contact: &str) -> Request {
+    let mut headers = vec![
+        Header {
+            name: "Via".to_string(),
+            value: via.to_string(),
+        },
+        Header {
+            name: "Max-Forwards".to_string(),
+            value: "70".to_string(),
+        },
+    ];
+    for header in &invite.headers {
+        if matches!(canonical_header(&header.name).as_str(), "from" | "call-id") {
+            headers.push(header.clone());
+        }
+    }
+    let to = header(&response.headers, "to")
+        .or_else(|| header(&invite.headers, "to"))
+        .unwrap_or("")
+        .to_string();
+    headers.push(Header {
+        name: "To".to_string(),
+        value: to,
+    });
+    let number = cseq_parts(header(&invite.headers, "cseq").unwrap_or(""))
+        .map(|(number, _)| number.to_string())
+        .unwrap_or_default();
+    headers.push(Header {
+        name: "CSeq".to_string(),
+        value: format!("{number} ACK"),
+    });
+    headers.push(Header {
+        name: "Contact".to_string(),
+        value: contact.to_string(),
+    });
+    let remote_target = header(&response.headers, "contact")
+        .map(crate::dialog::uri_of)
+        .filter(|uri| !uri.is_empty())
+        .unwrap_or(&invite.uri)
+        .to_string();
+    Request {
+        method: Method::Ack,
+        uri: remote_target,
         headers,
         body: Vec::new(),
     }

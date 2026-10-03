@@ -163,9 +163,10 @@ pub fn is_keepalive(input: &[u8]) -> bool {
 ///
 /// Single-letter compact forms (RFC 3261 §7.3.3) are expanded first:
 /// `v` → "via", `i` → "call-id", `m` → "contact", `l` → "content-length", etc.
+/// Compact letters are matched case-insensitively (real devices send `I:`).
 /// Used for comparisons only; the original spelling is kept in [`Header::name`].
 pub fn canonical_header(name: &str) -> String {
-    let expanded = match name {
+    let expanded = match name.to_ascii_lowercase().as_str() {
         "v" => "Via",
         "l" => "Content-Length",
         "f" => "From",
@@ -176,7 +177,7 @@ pub fn canonical_header(name: &str) -> String {
         "e" => "Content-Encoding",
         "s" => "Subject",
         "t" => "To",
-        other => other,
+        _ => name,
     };
     expanded.to_ascii_lowercase()
 }

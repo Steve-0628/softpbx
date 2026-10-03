@@ -52,11 +52,32 @@ pub const OUR_CODECS: [Codec; 3] = [Codec::Pcmu, Codec::Pcma, Codec::TelephoneEv
 /// Builds the SDP body we send (offer or answer): one audio stream of G.711,
 /// 10 ms packets, no silence suppression.
 pub fn audio_sdp(connection_ip: &str, port: u16) -> Vec<u8> {
-    let payload_types: Vec<String> = OUR_CODECS
+    build_sdp(connection_ip, port, &OUR_CODECS)
+}
+
+/// Builds an SDP answer limited to the codecs the offer actually contained
+/// (RFC 3264 §6: answer with the intersection, never a codec they did not
+/// offer). Falls back to our full list if the offer shares none of ours.
+pub fn audio_sdp_answer(connection_ip: &str, port: u16, offered_payload_types: &[u8]) -> Vec<u8> {
+    let shared: Vec<Codec> = OUR_CODECS
+        .iter()
+        .copied()
+        .filter(|codec| offered_payload_types.contains(&codec.payload_type()))
+        .collect();
+    let codecs: &[Codec] = if shared.is_empty() {
+        &OUR_CODECS
+    } else {
+        &shared
+    };
+    build_sdp(connection_ip, port, codecs)
+}
+
+fn build_sdp(connection_ip: &str, port: u16, codecs: &[Codec]) -> Vec<u8> {
+    let payload_types: Vec<String> = codecs
         .iter()
         .map(|codec| codec.payload_type().to_string())
         .collect();
-    let rtpmaps: Vec<&str> = OUR_CODECS.iter().map(|codec| codec.rtpmap()).collect();
+    let rtpmaps: Vec<&str> = codecs.iter().map(|codec| codec.rtpmap()).collect();
     format!(
         "v=0\r\n\
          o=softpbx 1 1 IN IP4 {connection_ip}\r\n\

@@ -4,9 +4,9 @@ use call::{transit, CallEvent, CallState, Command};
 
 #[test]
 fn happy_path() {
-    let (state, commands) = transit(CallState::Offering, CallEvent::CalleeRinging);
+    let (state, commands) = transit(CallState::Offering, CallEvent::CalleeProgress(180));
     assert_eq!(state, CallState::Ringing);
-    assert_eq!(commands, vec![Command::RingCaller]);
+    assert_eq!(commands, vec![Command::ProgressCaller(180)]);
 
     let (state, commands) = transit(CallState::Ringing, CallEvent::CalleeAnswered);
     assert_eq!(state, CallState::Answered);
@@ -19,6 +19,14 @@ fn happy_path() {
     let (state, commands) = transit(CallState::Terminating, CallEvent::Teardown);
     assert_eq!(state, CallState::Terminated);
     assert_eq!(commands, vec![Command::Finish]);
+}
+
+#[test]
+fn progress_keeps_the_real_code() {
+    // 183 Session Progress must not be downgraded to 180.
+    let (state, commands) = transit(CallState::Offering, CallEvent::CalleeProgress(183));
+    assert_eq!(state, CallState::Ringing);
+    assert_eq!(commands, vec![Command::ProgressCaller(183)]);
 }
 
 #[test]
@@ -54,6 +62,26 @@ fn cancel_while_setting_up() {
 }
 
 #[test]
+fn bye_before_answer_tears_down() {
+    // RFC 3261 §15: a BYE means "I want out", even in an early dialog.
+    for state in [CallState::Offering, CallState::Ringing] {
+        let (next, commands) = transit(state, CallEvent::CallerHungUp);
+        assert_eq!(next, CallState::Terminating);
+        assert_eq!(
+            commands,
+            vec![Command::CancelCaller, Command::CompleteCaller]
+        );
+
+        let (next, commands) = transit(state, CallEvent::CalleeHungUp);
+        assert_eq!(next, CallState::Terminating);
+        assert_eq!(
+            commands,
+            vec![Command::FailCaller(487), Command::CompleteCallee]
+        );
+    }
+}
+
+#[test]
 fn callee_hangs_up_first() {
     let (state, commands) = transit(CallState::Answered, CallEvent::CalleeHungUp);
     assert_eq!(state, CallState::Terminating);
@@ -63,10 +91,8 @@ fn callee_hangs_up_first() {
 #[test]
 fn uninteresting_events_change_nothing() {
     for (state, event) in [
-        (CallState::Answered, CallEvent::CalleeRinging),
-        (CallState::Ringing, CallEvent::CalleeRinging), // repeated 180
+        (CallState::Answered, CallEvent::CalleeProgress(180)),
         (CallState::Answered, CallEvent::CalleeAnswered), // repeated 200
-        (CallState::Offering, CallEvent::CallerHungUp), // BYE before answer
         (CallState::Terminated, CallEvent::CalleeAnswered),
         (CallState::Terminated, CallEvent::Teardown),
     ] {

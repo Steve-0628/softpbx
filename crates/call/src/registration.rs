@@ -4,10 +4,10 @@
 //! a REGISTER carrying digest credentials. We keep the binding in memory with
 //! an expiry; when the daemon restarts, phones simply register again.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use sip_stack::digest::{self, Challenge};
-use sip_stack::make_response;
+use sip_stack::{make_response, uri_of};
 use sip_syntax::{Header, Request, Response};
 
 /// Registration lifetime a device gets when it does not ask for one.
@@ -44,7 +44,12 @@ pub struct Registrar {
     devices: HashMap<String, Device>,
     bindings: HashMap<String, Binding>,
     nonce_counter: u64,
+    /// Nonces we handed out; only those verify (replay protection).
+    issued_nonces: VecDeque<String>,
 }
+
+/// How many outstanding nonces to remember (plenty for a small office).
+const MAX_NONCES: usize = 1_024;
 
 impl Registrar {
     /// Creates a registrar for the given devices.
@@ -57,6 +62,7 @@ impl Registrar {
                 .collect(),
             bindings: HashMap::new(),
             nonce_counter: 0,
+            issued_nonces: VecDeque::new(),
         }
     }
 
@@ -123,6 +129,11 @@ impl Registrar {
         response
     }
 
+    /// Whether a device has a live binding (it registered and has not expired).
+    pub fn is_registered(&self, number: &str, now_ms: u64) -> bool {
+        self.lookup(number, now_ms).is_some()
+    }
+
     /// Where a registered, unexpired device is.
     pub fn lookup(&self, number: &str, now_ms: u64) -> Option<&str> {
         let binding = self.bindings.get(number)?;
@@ -167,22 +178,36 @@ impl Registrar {
         let Some(credentials) = digest::parse_authorization(value) else {
             return false;
         };
+        // Only nonces we issued verify: a sniffed response cannot be replayed
+        // to rebind someone else's number.
+        if !self
+            .issued_nonces
+            .iter()
+            .any(|nonce| nonce == &credentials.nonce)
+        {
+            return false;
+        }
         credentials.username == device.number
             && digest::verify(&credentials, &device.secret, request.method.as_str())
     }
 
     fn next_nonce(&mut self, now_ms: u64) -> String {
         self.nonce_counter += 1;
-        format!("{now_ms:x}-{:x}", self.nonce_counter)
+        let nonce = format!("{now_ms:x}-{:x}", self.nonce_counter);
+        if self.issued_nonces.len() >= MAX_NONCES {
+            self.issued_nonces.pop_front();
+        }
+        self.issued_nonces.push_back(nonce.clone());
+        nonce
     }
 }
 
 /// The number a REGISTER is about: the user part of `To` (the address of
-/// record, RFC 3261 §10), falling back to the Request-URI.
-/// `<sip:1001@192.0.2.10>` → `1001`.
+/// record, RFC 3261 §10), falling back to the Request-URI. Display names are
+/// skipped (`"Alice" <sip:1001@host>` → `1001`).
 pub fn number_from_request(request: &Request) -> Option<String> {
     let to = header(&request.headers, "to").unwrap_or("");
-    number_from_uri(to).or_else(|| number_from_uri(&request.uri))
+    number_from_uri(uri_of(to)).or_else(|| number_from_uri(&request.uri))
 }
 
 /// The user part of a SIP URI: `<sip:1001@192.0.2.10>` → `1001`. A URI
