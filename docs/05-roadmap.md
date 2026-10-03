@@ -40,7 +40,10 @@ cleanly, repeatedly, for hours.
 Hold/transfer and ring groups are not planned now (docs/01). If they are wanted
 later, they fit after this step as small additions (docs/03 §5–6).
 
-## Step 4 — Trunk to a remote PBX
+## Step 4 — Trunk to a remote PBX *(priority after softphones)*
+
+Interoperability with **MikoPBX** is the goal here — this comes right after
+local softphones are verified, before any fax work.
 
 - SIP trunk to a MikoPBX-compatible PBX: calls between sites
 - Number range routing (site A = 2xx, site B = 3xx)
@@ -55,6 +58,8 @@ later, they fit after this step as small additions (docs/03 §5–6).
   path from docs/02 §8 makes this possible without rework); T.38 relay only if
   testing shows pass-through is not enough
 - Fix problems empirically against real machines; no pre-built fax architecture
+
+Fax work starts **after** the MikoPBX trunk (step 4) is solid.
 
 ## Not on the roadmap
 

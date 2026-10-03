@@ -47,6 +47,8 @@ pub enum Output {
     Send(Message),
     /// Send these RTP bytes to `to` ("ip:port") — the transparent pipe.
     SendRtp {
+        /// The relay port to send from (the one advertised to that leg).
+        from_port: u16,
         /// Destination address.
         to: String,
         /// The exact packet bytes to forward.
@@ -482,6 +484,7 @@ impl Switch {
             return vec![]; // the other side has not spoken yet
         };
         vec![Output::SendRtp {
+            from_port: target.our_port,
             to,
             data: packet.to_bytes().to_vec(),
         }]

@@ -8,3 +8,8 @@ publish.workspace = true
 [dependencies]
 call = { path = "../../crates/call" }
 sip-stack = { path = "../../crates/sip-stack" }
+sip-syntax = { path = "../../crates/sip-syntax" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true }

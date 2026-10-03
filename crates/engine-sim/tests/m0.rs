@@ -123,7 +123,7 @@ fn rtp_forwards(outputs: &[Output]) -> Vec<(String, Vec<u8>)> {
     outputs
         .iter()
         .filter_map(|output| match output {
-            Output::SendRtp { to, data } => Some((to.clone(), data.clone())),
+            Output::SendRtp { to, data, .. } => Some((to.clone(), data.clone())),
             _ => None,
         })
         .collect()
