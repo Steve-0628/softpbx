@@ -1731,3 +1731,106 @@ fn regression_retained_calls_are_garbage_collected() {
         "nothing leaks once obligations end"
     );
 }
+
+// ----- golden rejection tests (docs/07 §4 rule 2) ---------------------------
+
+/// Anything a request *requires* that we do not implement gets 420 with an
+/// Unsupported header — never half an extension (RFC 3261 §8.2.2.3).
+#[test]
+fn golden_require_gets_420_with_unsupported() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let invite = "INVITE sip:1002@192.0.2.10 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-golden-require\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:1001@192.0.2.10>;tag=from1\r\n\
+         To: <sip:1002@192.0.2.10>\r\n\
+         Call-ID: golden-require\r\n\
+         CSeq: 1 INVITE\r\n\
+         Require: 100rel, timer\r\n\
+         Supported: timer\r\n\
+         Contact: <sip:1001@192.0.2.1:5060>\r\n\
+         Content-Length: 0\r\n\r\n";
+    let outputs = feed(&mut world, &mut switch, invite.as_bytes());
+    let response = response_of(&outputs, 420);
+    let unsupported = header_value(&response.headers, "Unsupported").unwrap();
+    assert!(unsupported.contains("100rel"), "{unsupported}");
+    assert!(unsupported.contains("timer"), "{unsupported}");
+    assert_eq!(switch.active_calls(), 0, "no call is created");
+}
+
+/// Methods we do not implement get 405 with Allow — in-dialog too.
+#[test]
+fn golden_update_and_prack_get_405() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    for method in ["UPDATE", "PRACK", "REFER"] {
+        let request = format!(
+            "{method} sip:1002@192.0.2.10 SIP/2.0\r\n\
+             Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-golden-{method}\r\n\
+             Max-Forwards: 70\r\n\
+             From: <sip:1001@192.0.2.10>;tag=from1\r\n\
+             To: <sip:1002@192.0.2.10>\r\n\
+             Call-ID: golden-{method}\r\n\
+             CSeq: 1 {method}\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+        let outputs = feed(&mut world, &mut switch, request.as_bytes());
+        let response = response_of(&outputs, 405);
+        let allow = header_value(&response.headers, "Allow").expect("Allow header");
+        assert!(allow.contains("INVITE"), "{method}: {allow}");
+    }
+}
+
+/// Session timers: we never refresh, so the peer gets the refresher role
+/// (RFC 4028 §7.2) — its refreshes land on our re-INVITE handling.
+#[test]
+fn golden_session_timer_makes_the_peer_the_refresher() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let body = sdp_body("192.0.2.1:10000");
+    let invite = format!(
+        "INVITE sip:1002@192.0.2.10 SIP/2.0\r\n\
+         Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-golden-timer\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:1001@192.0.2.10>;tag=from1\r\n\
+         To: <sip:1002@192.0.2.10>\r\n\
+         Call-ID: golden-timer\r\n\
+         CSeq: 1 INVITE\r\n\
+         Session-Expires: 1800;refresher=uas\r\n\
+         Supported: timer\r\n\
+         Contact: <sip:1001@192.0.2.1:5060>\r\n\
+         Content-Type: application/sdp\r\n\
+         Content-Length: {}\r\n\r\n{}",
+        body.len(),
+        String::from_utf8(body).unwrap()
+    );
+    let outputs = feed(&mut world, &mut switch, invite.as_bytes());
+    let callee_invite = request_of(&outputs, Method::Invite);
+    let _ = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(&callee_invite, 180, "Ringing", "bob1", b""),
+    );
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(
+            &callee_invite,
+            200,
+            "OK",
+            "bob1",
+            &sdp_body("192.0.2.2:20000"),
+        ),
+    );
+    let answered = response_of(&outputs, 200);
+    let session = header_value(&answered.headers, "Session-Expires").expect("Session-Expires");
+    assert!(
+        session.contains("refresher=uac"),
+        "the peer must time the session: {session}"
+    );
+    assert!(session.starts_with("1800"), "interval preserved: {session}");
+}

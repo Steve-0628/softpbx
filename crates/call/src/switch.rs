@@ -275,6 +275,17 @@ impl Switch {
     }
 
     fn handle_request(&mut self, request: Request, now_ms: u64) -> Vec<Output> {
+        // RFC 3261 §8.2.2.3: never half-implement an extension. Anything the
+        // request *requires* that we do not implement gets 420 + Unsupported.
+        let unsupported = unsupported_require(&request);
+        if !unsupported.is_empty() {
+            let mut response = make_response(&request, 420, "Bad Extension");
+            response.headers.push(Header {
+                name: "Unsupported".to_string(),
+                value: unsupported.join(", "),
+            });
+            return vec![Output::Send(Message::Response(response))];
+        }
         match request.method {
             Method::Register => {
                 let response = self.registrar.handle_register(&request, now_ms);
@@ -970,6 +981,15 @@ impl Switch {
                     name: "Contact".to_string(),
                     value: contact,
                 });
+                // Session timers (RFC 4028): we never refresh, so hand the
+                // refresher role to the peer (§7.2 lets the UAS choose). The
+                // peer then refreshes with re-INVITE, which we absorb.
+                if let Some(seconds) = session_expires_of(&call.caller_invite) {
+                    response.headers.push(Header {
+                        name: "Session-Expires".to_string(),
+                        value: format!("{seconds};refresher=uac"),
+                    });
+                }
                 if let Some(media) = &call.media {
                     let offered = sdp_payload_types(&call.caller_invite.body);
                     response.headers.push(Header {
@@ -1226,6 +1246,33 @@ fn parse_timer_name(name: &str) -> Option<(u64, TxSlot, Timer)> {
     Some((id, slot, timer))
 }
 
+/// Option tags a request requires that we do not implement (RFC 3261 §8.2.2.3).
+/// We implement none, so every tag in `Require` is unsupported — and that is
+/// the honest answer (docs/07 §2).
+fn unsupported_require(request: &Request) -> Vec<String> {
+    request
+        .headers
+        .iter()
+        .filter(|header| canonical_header(&header.name) == "require")
+        .flat_map(|header| header.value.split(','))
+        .map(|tag| tag.trim().to_string())
+        .filter(|tag| !tag.is_empty())
+        .collect()
+}
+
+/// The session interval an INVITE proposes (RFC 4028 `Session-Expires`).
+fn session_expires_of(request: &Request) -> Option<u64> {
+    let value = header(&request.headers, "session-expires")?;
+    value
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .parse()
+        .ok()
+        .filter(|seconds: &u64| *seconds > 0)
+}
+
 /// Payload type numbers an SDP body offers, for codec intersection.
 fn sdp_payload_types(body: &[u8]) -> Vec<u8> {
     parse_sdp(body)
@@ -1340,7 +1387,10 @@ fn reason_phrase(status: u16) -> &'static str {
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         408 => "Request Timeout",
+        420 => "Bad Extension",
+        421 => "Extension Required",
         481 => "Call/Transaction Does Not Exist",
         486 => "Busy Here",
         487 => "Request Terminated",

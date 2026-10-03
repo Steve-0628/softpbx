@@ -89,9 +89,13 @@ Rejected with a standard error response or ignored:
 
 - Methods: `REFER`, `NOTIFY`, `INFO`, `PRACK`, `UPDATE`, `SUBSCRIBE`,
   `PUBLISH`, `MESSAGE`
-- SIP extensions: 100-rel, session timers (RFC 4028), Path, Outbound (RFC 5626
-  — except its double-CRLF keepalive, which is recognized and acknowledged),
-  GRUU, replaces, event packages (BLF, message waiting)
+- SIP extensions: 100-rel, session timers (RFC 4028 — see §3 for the one
+  concession), Path, Outbound (RFC 5626 — except its double-CRLF keepalive,
+  which is recognized and acknowledged), GRUU, replaces, event packages (BLF,
+  message waiting)
+- **`Require` is checked** (RFC 3261 §8.2.2.3): a request whose `Require`
+  names anything we do not implement gets `420 Bad Extension` with an
+  `Unsupported` header. We never half-implement an extension.
 - Media negotiation: ICE, RTCP, SRTP (`a=crypto`), RTCP-mux, multiple codecs
   beyond G.711
 - Transport: TCP, TLS, SCTP, WebSocket; DNS/SRV resolution (peers are IP
@@ -106,7 +110,8 @@ Rejected with a standard error response or ignored:
 | `REFER` / `NOTIFY` | Hold / transfer being wanted (docs/03 §5) |
 | Parallel forking (several early dialogs per call) | Ring groups being wanted (docs/03 §6) |
 | `INFO` + RFC 4733 telephone-event handling (DTMF) | Any feature that consumes DTMF; analog gateways |
-| `UPDATE` + session timers | Trunk work (step 4): MikoPBX/Asterisk peers use them for refresh |
+| `UPDATE` as a refresh mechanism | MikoPBX/Asterisk capture shows the peer refreshes with UPDATE (re-INVITE refreshes already work) |
+| Full session timers (RFC 4028) | Peer capture shows we must be refresher. Policy until then: if an INVITE carries `Session-Expires`, we answer with `…;refresher=uac` — **the peer** times and refreshes the session (RFC 4028 §7.2 lets the UAS choose), and our re-INVITE handling absorbs its refreshes. `Require: timer` is answered `420` like any unsupported extension |
 | TCP transport | A real device that cannot do UDP (none expected at this size) |
 | `183` early media handling | Trunk or gateway interop shows it matters |
 | Direction attributes (`sendonly` etc.) | Hold / music-on-hold |
