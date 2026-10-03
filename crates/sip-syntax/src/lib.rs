@@ -1,167 +1,221 @@
-//! SIP メッセージと SDP の構文解析。
+//! SIP message and SDP parsing.
 //!
-//! # 責務
+//! Pure functions: no I/O, no dependencies. Input is bytes, output is typed data.
+//! Malformed input produces a [`ParseError`] — never a panic, never unbounded
+//! memory growth (docs/07).
 //!
-//! - SIP リクエスト/レスポンスのパースと直列化
-//! - SDP のパースと直列化（docs/05-protocol-scope.md）
-//!
-//! # 設計上のルール
-//!
-//! - **I/O を行わない。** 入力はバイト列、出力は型付きデータのみ。
-//! - **依存を持たない純粋層。** ここを壊すと全部壊れるので、もっとも厚くテストする。
-//! - ゼロコピーを基本とするが、雛形段階では所有型で表す（実装時に借用版へ移行）。
-//! - **ファジングの主要ターゲット**（docs/06 §4）。パニックしてはならない。
+//! The boundary of what we parse is defined in `docs/07-sip-subset.md`. This
+//! crate is deliberately lenient about *what* it accepts (real phones are
+//! messy) and strict about *how much* (resource limits).
 
-/// SIP のバージョン。
+mod parse;
+mod sdp;
+mod serialize;
+
+pub use parse::{parse_message, parse_message_with_limits};
+pub use sdp::{parse_sdp, MediaDescription, Sdp};
+pub use serialize::serialize_message;
+
+/// SIP version. Only SIP/2.0 exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Version {
-    /// SIP/2.0 のみを扱う。
+    /// SIP/2.0.
     V2,
 }
 
-/// SIP メソッド。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// SIP method.
+///
+/// The six methods we implement are named variants. Anything else is kept
+/// verbatim in [`Method::Other`]: we still parse it (so we can answer 405 with
+/// an `Allow` header, docs/07), but we do not act on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Method {
-    /// 通話確立。
+    /// Call setup.
     Invite,
-    /// INVITE の確認。
+    /// Confirms an INVITE.
     Ack,
-    /// 通話終了。
+    /// Ends a call.
     Bye,
-    /// 通話取り消し。
+    /// Cancels a call that is still ringing.
     Cancel,
-    /// 位置登録。
+    /// Registers a device's address.
     Register,
-    /// 転送（RFC 3515）。
-    Refer,
-    /// 能力照会・キープアライブ。
+    /// Capability probe / keepalive.
     Options,
-    /// 中間情報（DTMF など）。
-    Info,
-    /// イベント購読。
-    Subscribe,
-    /// イベント通知。
-    Notify,
-    /// メッセージ送信。
-    Message,
-    /// セッション更新（RFC 3311）。
-    Update,
-    /// 信頼できる暫定応答の確認。
-    Prack,
+    /// Any other method, kept exactly as received.
+    Other(String),
 }
 
 impl Method {
-    /// ワイヤ上の表記（"INVITE" など）を返す。
-    pub fn as_str(self) -> &'static str {
+    /// Parses a wire-form method name (case-sensitive, as the RFC requires).
+    pub fn parse(name: &str) -> Self {
+        match name {
+            "INVITE" => Method::Invite,
+            "ACK" => Method::Ack,
+            "BYE" => Method::Bye,
+            "CANCEL" => Method::Cancel,
+            "REGISTER" => Method::Register,
+            "OPTIONS" => Method::Options,
+            other => Method::Other(other.to_string()),
+        }
+    }
+
+    /// The wire form ("INVITE" etc.).
+    pub fn as_str(&self) -> &str {
         match self {
             Method::Invite => "INVITE",
             Method::Ack => "ACK",
             Method::Bye => "BYE",
             Method::Cancel => "CANCEL",
             Method::Register => "REGISTER",
-            Method::Refer => "REFER",
             Method::Options => "OPTIONS",
-            Method::Info => "INFO",
-            Method::Subscribe => "SUBSCRIBE",
-            Method::Notify => "NOTIFY",
-            Method::Message => "MESSAGE",
-            Method::Update => "UPDATE",
-            Method::Prack => "PRACK",
+            Method::Other(name) => name,
         }
     }
 }
 
-/// ヘッダフィールド（名前と値）。順序は保持する。
+/// A header field (name and value). Order of appearance is preserved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
-    /// フィールド名（大文字小文字は無視するが、元の表記を保持する）。
+    /// Field name, with the spelling the sender used ("Call-ID", "call-id", "i").
     pub name: String,
-    /// フィールド値（前後の空白を除いた形）。
+    /// Field value, surrounding whitespace trimmed.
     pub value: String,
 }
 
-/// SIP リクエスト。
+/// A SIP request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
-    /// メソッド。
+    /// Method.
     pub method: Method,
-    /// リクエスト URI。
+    /// Request-URI, kept as a string (we copy and compare; we do not audit it).
     pub uri: String,
-    /// ヘッダ群（出現順）。
+    /// Header fields in order of appearance.
     pub headers: Vec<Header>,
-    /// ボディ。
+    /// Body (e.g. SDP).
     pub body: Vec<u8>,
 }
 
-/// SIP レスポンス。
+/// A SIP response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
-    /// ステータスコード。
+    /// Status code (100..=699).
     pub status: u16,
-    /// 理由句。
+    /// Reason phrase.
     pub reason: String,
-    /// ヘッダ群（出現順）。
+    /// Header fields in order of appearance.
     pub headers: Vec<Header>,
-    /// ボディ。
+    /// Body (e.g. SDP).
     pub body: Vec<u8>,
 }
 
-/// SIP メッセージ。
+/// A SIP message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
-    /// リクエスト。
+    /// A request.
     Request(Request),
-    /// レスポンス。
+    /// A response.
     Response(Response),
 }
 
-/// 構文解析の失敗理由。
+impl Message {
+    /// Header fields in order of appearance.
+    pub fn headers(&self) -> &[Header] {
+        match self {
+            Message::Request(r) => &r.headers,
+            Message::Response(r) => &r.headers,
+        }
+    }
+
+    /// Body bytes.
+    pub fn body(&self) -> &[u8] {
+        match self {
+            Message::Request(r) => &r.body,
+            Message::Response(r) => &r.body,
+        }
+    }
+
+    /// First header field matching `name`, compared case-insensitively with
+    /// compact forms resolved ("i" finds "Call-ID", and vice versa).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers_all(name).first().copied()
+    }
+
+    /// Every header field matching `name`, in order of appearance.
+    pub fn headers_all(&self, name: &str) -> Vec<&str> {
+        let want = canonical_header(name);
+        self.headers()
+            .iter()
+            .filter(|h| canonical_header(&h.name) == want)
+            .map(|h| h.value.as_str())
+            .collect()
+    }
+}
+
+/// Canonical (lowercase, long form) name of a header field.
 ///
-/// ファジングでは、この列挙型のどれかで**必ず**失敗すること（パニックしないこと）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Single-letter compact forms (RFC 3261 §7.3.3) are expanded first:
+/// `v` → "via", `i` → "call-id", `m` → "contact", `l` → "content-length", etc.
+/// Used for comparisons only; the original spelling is kept in [`Header::name`].
+pub fn canonical_header(name: &str) -> String {
+    let expanded = match name {
+        "v" => "Via",
+        "l" => "Content-Length",
+        "f" => "From",
+        "i" => "Call-ID",
+        "m" => "Contact",
+        "c" => "Content-Type",
+        "k" => "Supported",
+        "e" => "Content-Encoding",
+        "s" => "Subject",
+        "t" => "To",
+        other => other,
+    };
+    expanded.to_ascii_lowercase()
+}
+
+/// Why parsing failed.
+///
+/// Fuzzing contract: arbitrary input must produce one of these — never a panic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParseError {
-    /// 入力が途中で切れている（分割到着の続きが必要）。
+    /// Input ends mid-message; the caller should supply the rest (TCP streams).
+    /// Over UDP a complete datagram that yields this is simply rejected.
     Incomplete,
-    /// リクエストラインが不正。
+    /// The start line is malformed.
     BadStartLine,
-    /// ヘッダが不正（コロン欠落、制御文字を含むなど）。
+    /// A header field is malformed (missing colon, bad name, control bytes).
     BadHeader,
-    /// Content-Length とボディ長が一致しない。
+    /// `Content-Length` is unusable: not a number, or two conflicting values.
     BadBodyLength,
-    /// ヘッダ数・行長などの上限を超えた（リソース保護）。
+    /// A resource limit was exceeded (see [`Limits`]).
     LimitExceeded,
 }
 
-/// SIP メッセージを解析する。
-///
-/// 入力が足りない場合は [`ParseError::Incomplete`] を返す（呼び出し側で続きを蓄積する）。
-pub fn parse_message(_input: &[u8]) -> Result<Message, ParseError> {
-    // TODO(M0): RFC 3261 §7 の構文を実装する。上限値（ヘッダ数・行長・ボディ長）を必ず設ける。
-    todo!()
+/// Resource limits for parsing. Defaults are generous for SIP, tight enough to
+/// be safe against garbage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Maximum total message size in bytes (docs/07: UDP cap).
+    pub max_message: usize,
+    /// Maximum start line length.
+    pub max_start_line: usize,
+    /// Maximum length of one header line.
+    pub max_header_line: usize,
+    /// Maximum number of header fields.
+    pub max_headers: usize,
+    /// Maximum body size.
+    pub max_body: usize,
 }
 
-/// SDP のセッション記述（docs/05）。RFC 4566。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Sdp {
-    /// `m=` 行のメディア記述。
-    pub media: Vec<MediaDescription>,
-}
-
-/// `m=` で始まるメディア記述。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MediaDescription {
-    /// メディア種別（"audio" / "image" / "application" など）。
-    pub media: String,
-    /// 送信先ポート。
-    pub port: u16,
-    /// トランスポート（"RTP/AVP" / "udptl" など）。
-    pub transport: String,
-    /// ペイロードタイプ番号。
-    pub payload_types: Vec<u8>,
-}
-
-/// SDP を解析する。
-pub fn parse_sdp(_input: &[u8]) -> Result<Sdp, ParseError> {
-    // TODO(M0): RFC 4566 の構文を実装する。FAX/モデムでは `m=image`（T.38）を扱う。
-    todo!()
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            max_message: 65_535,
+            max_start_line: 1_024,
+            max_header_line: 8_192,
+            max_headers: 128,
+            max_body: 16_384,
+        }
+    }
 }

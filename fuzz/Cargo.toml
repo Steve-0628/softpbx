@@ -1,0 +1,25 @@
+[package]
+name = "sip-syntax-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.sip-syntax]
+path = "../crates/sip-syntax"
+
+[[bin]]
+name = "parse_message"
+path = "fuzz_targets/parse_message.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone workspace: fuzzing tooling manages this crate itself.
+[workspace]
+members = ["."]

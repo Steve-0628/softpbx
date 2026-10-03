@@ -6,4 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-# 依存を持たない純粋層。I/O も行わない（docs/02 §7）
+# Pure layer: no dependencies, no I/O (docs/02 §2).
+
+[dev-dependencies]
+proptest = { workspace = true }

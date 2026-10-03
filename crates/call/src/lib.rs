@@ -98,12 +98,25 @@ pub fn transit(state: CallState, event: CallEvent) -> (CallState, Vec<Command>) 
         (Answered, JoinConference) => (Conferencing, vec![Command::AllocateMedia]),
         (Answered, FaxDetected) => (VbdFax, vec![Command::EnterVbd]),
         (Answered, ModemDetected) => (VbdModem, vec![Command::EnterVbd]),
-        (Held | Transferring | Conferencing | VbdFax | VbdModem | Answered, Hangup | RemoteHangup | Timeout) => {
-            (Terminating, vec![Command::SendSip, Command::ReleaseMedia, Command::WriteCallLog])
-        }
-        (Offering | Ringing, Hangup | RemoteHangup | Timeout) => {
-            (Terminating, vec![Command::SendSip, Command::ReleaseMedia, Command::WriteCallLog])
-        }
+        (
+            Held | Transferring | Conferencing | VbdFax | VbdModem | Answered,
+            Hangup | RemoteHangup | Timeout,
+        ) => (
+            Terminating,
+            vec![
+                Command::SendSip,
+                Command::ReleaseMedia,
+                Command::WriteCallLog,
+            ],
+        ),
+        (Offering | Ringing, Hangup | RemoteHangup | Timeout) => (
+            Terminating,
+            vec![
+                Command::SendSip,
+                Command::ReleaseMedia,
+                Command::WriteCallLog,
+            ],
+        ),
         (Terminating, _) => (Terminated, vec![]),
         (Terminated, _) => (Terminated, vec![]),
         (state, _) => (state, vec![]),
