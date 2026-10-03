@@ -89,8 +89,8 @@ impl Default for NetworkConfig {
 pub enum Event {
     /// A named timer the test armed.
     Timer {
-        /// Timer name ("A", "B", "response-1", ...).
-        name: &'static str,
+        /// Timer name ("A", "call:...:B", ...).
+        name: String,
     },
     /// A datagram delivered between two nodes.
     Datagram {
@@ -142,6 +142,11 @@ impl World {
         self.clock.now_ms
     }
 
+    /// Moves time forward without any event firing (for step-by-step tests).
+    pub fn advance(&mut self, ms: u64) {
+        self.clock.advance(ms);
+    }
+
     /// Seeded randomness (for tests that need it).
     pub fn rng(&mut self) -> &mut SimRng {
         &mut self.rng
@@ -149,8 +154,9 @@ impl World {
 
     /// Arms a named timer for an absolute time. Arming a name replaces any
     /// outstanding timer with that name.
-    pub fn arm(&mut self, name: &'static str, at_ms: u64) {
-        self.disarm(name);
+    pub fn arm(&mut self, name: impl Into<String>, at_ms: u64) {
+        let name = name.into();
+        self.disarm(&name);
         self.log(format!("arm {name} at {at_ms}"));
         let seq = self.take_seq();
         self.queue.push(Scheduled {
@@ -161,14 +167,15 @@ impl World {
     }
 
     /// Arms a named timer relative to now.
-    pub fn arm_in(&mut self, name: &'static str, ms: u64) {
+    pub fn arm_in(&mut self, name: impl Into<String>, ms: u64) {
         self.arm(name, self.now_ms() + ms);
     }
 
     /// Disarms a named timer (no-op if not armed).
-    pub fn disarm(&mut self, name: &'static str) {
-        self.queue
-            .retain(|scheduled| scheduled.event != Event::Timer { name });
+    pub fn disarm(&mut self, name: &str) {
+        self.queue.retain(
+            |scheduled| !matches!(&scheduled.event, Event::Timer { name: armed } if armed == name),
+        );
     }
 
     /// Sends a datagram: subject to loss and delay, then delivered as an event.

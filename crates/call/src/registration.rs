@@ -185,7 +185,9 @@ pub fn number_from_request(request: &Request) -> Option<String> {
     number_from_uri(to).or_else(|| number_from_uri(&request.uri))
 }
 
-fn number_from_uri(uri: &str) -> Option<String> {
+/// The user part of a SIP URI: `<sip:1001@192.0.2.10>` → `1001`. A URI
+/// without `@` has no user part at all.
+pub fn number_from_uri(uri: &str) -> Option<String> {
     let uri = uri.trim().trim_start_matches('<').trim_end_matches('>');
     let rest = uri
         .strip_prefix("sip:")
@@ -239,7 +241,7 @@ fn requested_expires_s(request: &Request) -> Option<u64> {
     None
 }
 
-fn header<'a>(headers: &'a [Header], name: &str) -> Option<&'a str> {
+pub(crate) fn header<'a>(headers: &'a [Header], name: &str) -> Option<&'a str> {
     let want = sip_syntax::canonical_header(name);
     headers
         .iter()

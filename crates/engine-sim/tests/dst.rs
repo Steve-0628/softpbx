@@ -56,7 +56,7 @@ struct Outcome {
     delivered: Vec<u16>,
 }
 
-fn timer_of(name: &'static str) -> Timer {
+fn timer_of(name: &str) -> Timer {
     match name {
         "A" => Timer::A,
         "B" => Timer::B,
@@ -71,17 +71,17 @@ fn timer_of(name: &'static str) -> Timer {
     }
 }
 
-fn name_of(timer: Timer) -> &'static str {
+fn name_of(timer: Timer) -> String {
     match timer {
-        Timer::A => "A",
-        Timer::B => "B",
-        Timer::D => "D",
-        Timer::E => "E",
-        Timer::F => "F",
-        Timer::G => "G",
-        Timer::H => "H",
-        Timer::I => "I",
-        Timer::J => "J",
+        Timer::A => "A".to_string(),
+        Timer::B => "B".to_string(),
+        Timer::D => "D".to_string(),
+        Timer::E => "E".to_string(),
+        Timer::F => "F".to_string(),
+        Timer::G => "G".to_string(),
+        Timer::H => "H".to_string(),
+        Timer::I => "I".to_string(),
+        Timer::J => "J".to_string(),
     }
 }
 
@@ -115,7 +115,7 @@ fn drive(world: &mut World, tx: &mut ClientTransaction, initial: Vec<Action>) ->
     while let Some(event) = world.next_event() {
         match event {
             Event::Timer { name } => {
-                let actions = tx.on_timer(timer_of(name), world.now_ms());
+                let actions = tx.on_timer(timer_of(&name), world.now_ms());
                 apply(world, &mut outcome, actions);
             }
             Event::Datagram { data, .. } => {
