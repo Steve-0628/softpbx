@@ -38,6 +38,7 @@ tokio = { version = "1", features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 winnow = "0.6"          # candidate for SIP/SDP parsing (sip-syntax)
+md-5 = "0.10"           # digest authentication (sip-stack)
 proptest = "1"
 
 [profile.release]

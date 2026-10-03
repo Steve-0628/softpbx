@@ -5,10 +5,10 @@
 //! no socket and no timer inside — the deterministic simulation (docs/04) or
 //! the real runtime drives it.
 
+pub mod digest;
 mod transaction;
 
-pub use transaction::ClientTransaction;
 pub use transaction::{
-    ack_for_non_2xx, branch, cseq_parts, make_response, Action, ClientState, ServerState,
-    ServerTransaction, Timer, GIVE_UP_MS, T1_MS, T2_MS, T4_MS, TIMER_D_MS,
+    ack_for_non_2xx, branch, cseq_parts, make_response, Action, ClientState, ClientTransaction,
+    ServerState, ServerTransaction, Timer, GIVE_UP_MS, T1_MS, T2_MS, T4_MS, TIMER_D_MS,
 };
