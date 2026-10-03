@@ -87,3 +87,26 @@ failures so far have all been found by tests and reviewers instead.
 - twinkle as a third phone; a hardphone when one is available
 - The same recipe against a **MikoPBX trunk** (roadmap step 4) — interop
   findings get recorded here per device
+
+## 6. MikoPBX (the trunk peer) — what it actually is
+
+Captured 2026-10 against MikoPBX 2026.3.40 (Asterisk 22.8.2 / chan_pjsip).
+Full evidence and verbatim messages: [reference/mikopbx-2026.3.md](reference/mikopbx-2026.3.md).
+The facts that shape the trunk work:
+
+| Fact | Consequence for us |
+| --- | --- |
+| **No session timers, ever** (`timers=no`; 78 s call with zero mid-dialog traffic) | the scariest interop risk is gone; our `refresher=uac` answer stays but will likely never fire |
+| No UPDATE, no PRACK, no re-INVITE refresh from it | our SIP subset is closer than feared |
+| It sends **OPTIONS qualify probes every 60 s** | our OPTIONS handling is load-bearing — never break it |
+| **It challenges INVITEs** from authenticated endpoints (401 before call setup) | trunk legs are exempt (IP identify / inbound registration) — the trunk shape avoids this; a future direct-extension dial would need INVITE digest |
+| Trunk modes: **outbound registration / inbound registration / static IP** | MikoPBX *registers to us* works today (verified live); no outbound REGISTER client needed for the first interop shape |
+| Digest MD5, `qop=auth` + `opaque` when it challenges; it answers challenges with or without qop | our qop-less challenge is fine (verified); its challenges need qop=auth computation when we are the client |
+| With trunk `username` set, `From`/`Contact` become the trunk login — **the real caller disappears** | use no-username/IP trunk mode (or `fromuser`/`manualattributes`) so caller identity survives; it never sends PAI on trunk legs |
+| Codecs offered: opus, PCMA, PCMU, G729, G722, GSM + two telephone-events (fmtp `0-16`) | our answer intersects to PCMA/PCMU/101 — fine; note the odd fmtp |
+| `183` with SDP appears on internal legs (`inband_progress=yes`) | early media is still deferred; we forward the status code only |
+| Provider AORs take exactly **one** contact (`max_contacts=1`) | when *we* register to it later, reuse one source port |
+
+First interop already happened: MikoPBX registered to a test `pbx-daemon`,
+re-registers every ~60 s, and its INVITEs are answered correctly (`404` for an
+unmapped number, ACKed and torn down cleanly).

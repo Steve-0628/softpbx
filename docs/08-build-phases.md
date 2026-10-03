@@ -95,29 +95,37 @@ test; the config validator rejects nonsense rules at startup.
 
 ## Phase 9 — Trunk core (roadmap step 4, part one)
 
-Before touching a real peer, the trunk exists in the simulation:
+Before touching the real peer, the trunk exists in the simulation — but now
+shaped by **what MikoPBX actually does** (docs/09 §6, captured 2026-10):
 
 - `[[trunk]]` config: peer address, authentication (digest and/or IP), its
   number range and ours
-- Outbound: routing rules that send a number range down a trunk; the callee
-  leg becomes a trunk leg (its own Call-IDs, its own quirks)
-- Inbound: INVITEs from the trunk authenticate (this is where digest-on-INVITE
-  gets built — a trunk peer does not "register"), map to local devices
-- Whatever the peer forces into the SIP subset (likely UPDATE / session
-  timers / 100rel — decided by what MikoPBX actually sends, docs/07 grown
-  first, per its §4 rules)
+- Outbound: routing rules that send a number range down a trunk (the phase 8
+  engine already does number ranges — the target just gains "trunk X"); the
+  callee leg becomes a trunk leg (its own Call-IDs, its own quirks)
+- Inbound: INVITEs from the trunk map to local devices. **Trunk legs are not
+  challenged** (IP identify / inbound registration) — and the simplest shape
+  has *MikoPBX register to us*, which already works against today's registrar
+- Answer its 60 s OPTIONS probes (today's behavior — keep), keep re-REGISTER
+  working (today's behavior), and preserve caller identity on the leg (its
+  `username` trunk mode hides the real caller — configure it accordingly)
+- What the capture says we do **not** need: session timers, UPDATE, PRACK, an
+  outbound REGISTER client. The SIP subset stays as it is (docs/07)
 
 **Done when:** site-to-site call scenarios (both directions, busy, no-answer,
-hang-up both sides, lost packets) pass in the DST against a fake remote PBX.
+hang-up both sides, lost packets) pass in the DST against a fake remote PBX
+that speaks the captured MikoPBX wire forms.
 
 ## Phase 10 — MikoPBX interop (roadmap step 4, part two)
 
-The real thing — this needs a MikoPBX instance to talk to (external
-dependency: provided or installed here).
+The real thing. **Environment is ready**: MikoPBX 2026.3.40 runs at
+`192.168.77.108` (QEMU, tap bridge `192.168.77.1/24`, tmux `miko`; restart
+instructions in [reference/mikopbx-2026.3.md](reference/mikopbx-2026.3.md)),
+admin/admin, extensions and trunks already configured from the capture work.
 
-- Bring-up: registration/trunk both directions, calls site to site
-- Interop matrix in docs/09 per behavior (session refresh, re-INVITE order,
-  caller-ID handling, CANCEL/BYE races) with quirk-table entries for each
+- Bring-up: trunk both directions, calls site to site (already half-done:
+  MikoPBX registers to softpbx and sends INVITEs today)
+- Interop matrix in docs/09 per behavior, with quirk-table entries for each
   divergence
 - Soak: 72 hours of periodic site-to-site calls
 
