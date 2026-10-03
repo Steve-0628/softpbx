@@ -19,7 +19,7 @@ Design stance: **small, understandable, and honest about what it is not.**
 | --- | --- |
 | Devices | Phones register with a number and a password |
 | Calls | Calls between devices with G.711 audio |
-| Call routing | Rules for where a call goes — **not built yet**, roadmap step 3 (today a dialed number rings the device with that number) |
+| Call routing | Rules for where a dialed number goes: wildcards, rewriting (`strip`), refusal, fixed destinations (docs/03 §4) |
 
 ## What it does not do
 

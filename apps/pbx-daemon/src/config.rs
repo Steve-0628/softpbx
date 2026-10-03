@@ -15,9 +15,42 @@ use serde::Deserialize;
 pub struct FileConfig {
     /// Global settings.
     pub general: General,
+    /// Call routing rules, in order (docs/03 §4). Optional: without any, a
+    /// dialed number simply rings the device with that number.
+    #[serde(default)]
+    pub routing: Vec<RoutingRule>,
     /// Devices that may register and be called.
     #[serde(default)]
     pub device: Vec<DeviceCfg>,
+}
+
+/// One `[[routing]]` rule: `match` a dialed number, `to` a destination.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingRule {
+    /// Pattern over the dialed number (`*`, `?` wildcards).
+    #[serde(rename = "match")]
+    pub pattern: String,
+    /// "dialed" (ring the device with that number), "reject", or a number.
+    pub to: String,
+    /// Optional prefix stripped from the dialed number first.
+    #[serde(default)]
+    pub strip: Option<String>,
+}
+
+impl RoutingRule {
+    fn to_rule(&self) -> call::Rule {
+        let action = match self.to.as_str() {
+            "dialed" => call::Action::Dialed,
+            "reject" => call::Action::Reject,
+            number => call::Action::Number(number.to_string()),
+        };
+        call::Rule {
+            pattern: self.pattern.clone(),
+            action,
+            strip: self.strip.clone(),
+        }
+    }
 }
 
 /// `[general]`.
@@ -97,6 +130,21 @@ impl FileConfig {
         if self.device.is_empty() {
             bail!("no [[device]] sections: nothing could register");
         }
+        for rule in &self.routing {
+            if rule.pattern.is_empty() {
+                bail!("a [[routing]] rule has an empty match");
+            }
+            let known = rule.to == "dialed"
+                || rule.to == "reject"
+                || (!rule.to.is_empty() && rule.to.bytes().all(|b| b.is_ascii_digit()));
+            if !known {
+                bail!(
+                    "routing match \"{}\": to must be \"dialed\", \"reject\" or a number, got \"{}\"",
+                    rule.pattern,
+                    rule.to
+                );
+            }
+        }
         let mut numbers = HashSet::new();
         for device in &self.device {
             if device.number.is_empty() {
@@ -122,6 +170,7 @@ impl FileConfig {
             rtp_host: self.general.rtp_host.clone(),
             rtp_port_base: self.general.rtp_port_base,
             rtp_ports: self.general.rtp_ports,
+            routing: self.routing.iter().map(RoutingRule::to_rule).collect(),
             devices: self
                 .device
                 .iter()
@@ -206,5 +255,24 @@ mod tests {
             format!("{GOOD}\n[[device]]\nnumber = \"1001\"\nname = \"Twin\"\nsecret = \"x\"\n");
         let error = FileConfig::parse(&doubled).expect_err("duplicate");
         assert!(format!("{error:#}").contains("duplicate"));
+    }
+
+    #[test]
+    fn routing_rules_validate() {
+        let good = format!(
+            "{GOOD}\n[[routing]]\nmatch = \"9*\"\nto = \"dialed\"\nstrip = \"9\"\n\n\
+             [[routing]]\nmatch = \"0\"\nto = \"1001\"\n\n\
+             [[routing]]\nmatch = \"1*\"\nto = \"reject\"\n"
+        );
+        let config = FileConfig::parse(&good).expect("valid routing");
+        assert_eq!(config.routing.len(), 3);
+        assert_eq!(config.switch_config().routing.len(), 3);
+
+        let bad_to = format!("{GOOD}\n[[routing]]\nmatch = \"9*\"\nto = \"somewhere\"\n");
+        let error = FileConfig::parse(&bad_to).expect_err("unknown destination");
+        assert!(format!("{error:#}").contains("dialed"), "{error:#}");
+
+        let empty_match = format!("{GOOD}\n[[routing]]\nmatch = \"\"\nto = \"dialed\"\n");
+        assert!(FileConfig::parse(&empty_match).is_err());
     }
 }

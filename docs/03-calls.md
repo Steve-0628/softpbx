@@ -57,20 +57,35 @@ explicitly (an enum plus a transition function), because "what happens if Bob
 hangs up while the call is being set up" is exactly the kind of question we
 want to answer with a test rather than with a phone on a desk.
 
-## 4. Call routing (not built yet)
+## 4. Call routing
 
-The plan: a list of rules — *"when someone dials something matching this
-pattern, do that"*, first match wins — with number rewriting and rejection
-along the way. Today there are no rules at all: a dialed number simply rings
-the device with that number, and anything else gets `404`.
+A short ordered list of rules — *"when someone dials something matching this
+pattern, do that"*. First match wins; a number that matches no rule simply
+rings the device with that number (`404` if there is none).
 
-This is roadmap step 3 (docs/05). When it lands, the actions will be:
+```toml
+[[routing]]
+match = "0"          # what the caller dialed (* and ? are wildcards)
+to = "1001"          # the operator
 
-| Action | Meaning |
+[[routing]]
+match = "9*"         # dial 9 to reach the outside world…
+to = "dialed"        # …and drop the 9 before looking the number up
+strip = "9"
+
+[[routing]]
+match = "1*"         # 1xxx is reserved, not dialable
+to = "reject"
+```
+
+| `to` | Meaning |
 | --- | --- |
-| `device` | Ring the device whose number was dialed |
-| `device` with a fixed number | Ring that specific device |
-| `reject` | Don't allow this number (e.g. dial 0 for outside line → no) |
+| `dialed` | Ring the device with the (possibly stripped) dialed number |
+| `reject` | Refuse the call (`403`, logged as `restricted`) |
+| a number | Ring that specific device |
+
+The callee's number, as the callee sees it, is the *routed* number — routing
+decides identity as well as destination.
 
 Later: ring groups, rules that send a call to a trunk (remote PBX), rules for a
 fax machine on a gateway port.

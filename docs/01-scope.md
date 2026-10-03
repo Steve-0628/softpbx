@@ -18,8 +18,7 @@ one team can hold entirely in their heads.
   and a password (SIP digest authentication).
 - Calls between devices: ringing, answering, G.711 audio both ways, hanging up.
 - Call routing: rules mapping a dialed number to a destination, with number
-  rewriting and rejection. *(Not built yet — roadmap step 3. Today a dialed
-  number simply rings the device with that number.)*
+  rewriting and rejection (docs/03 §4).
 
 ### Later
 

@@ -14,6 +14,7 @@ fn switch() -> Switch {
         rtp_host: "192.0.2.10".to_string(),
         rtp_port_base: 10_000,
         rtp_ports: 100,
+        routing: vec![],
         devices: vec![
             Device {
                 number: "1001".to_string(),

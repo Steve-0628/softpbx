@@ -11,7 +11,7 @@
 //! Everything runs on the deterministic world and speaks real SIP: messages
 //! cross the boundary as bytes.
 
-use call::{CallState, Device, Output, Switch, SwitchConfig};
+use call::{Action, CallState, Device, Output, Rule, Switch, SwitchConfig};
 use engine_sim::{Event, World};
 use rtp::Packet;
 use sip_stack::digest::{expected_response, Credentials};
@@ -30,6 +30,10 @@ fn switch_with(devices: Vec<Device>) -> Switch {
 }
 
 fn switch_with_ports(devices: Vec<Device>, rtp_ports: u16) -> Switch {
+    switch_with_routing(devices, rtp_ports, vec![])
+}
+
+fn switch_with_routing(devices: Vec<Device>, rtp_ports: u16, routing: Vec<call::Rule>) -> Switch {
     Switch::new(SwitchConfig {
         realm: REALM.to_string(),
         pbx_uri: PBX_URI.to_string(),
@@ -38,6 +42,7 @@ fn switch_with_ports(devices: Vec<Device>, rtp_ports: u16) -> Switch {
         rtp_host: "192.0.2.10".to_string(),
         rtp_port_base: 10_000,
         rtp_ports,
+        routing,
         devices,
     })
 }
@@ -1754,6 +1759,72 @@ fn regression_retained_calls_are_garbage_collected() {
         0,
         "nothing leaks once obligations end"
     );
+}
+
+// ----- call routing (docs/03 §4) -------------------------------------------
+
+/// Routing rules decide where a dialed number goes: fixed destinations,
+/// prefix stripping, and refusal — first match wins.
+#[test]
+fn ac_call_routing() {
+    let rules = vec![
+        Rule {
+            pattern: "0".to_string(),
+            action: Action::Number("1002".to_string()),
+            strip: None,
+        },
+        Rule {
+            pattern: "9*".to_string(),
+            action: Action::Dialed,
+            strip: Some("9".to_string()),
+        },
+        Rule {
+            pattern: "1*".to_string(),
+            action: Action::Reject,
+            strip: None,
+        },
+    ];
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch_with_routing(phones(), 100, rules);
+    register_both(&mut world, &mut switch);
+
+    // "0" is the operator: rings 1002 whatever the dialer expected.
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite_bytes("1001", "0", "route-op", "192.0.2.1:10000"),
+    );
+    let callee_invite = request_of(&outputs, Method::Invite);
+    let to = header_value(&callee_invite.headers, "to").unwrap();
+    assert!(to.contains("1002"), "0 routes to 1002: {to}");
+
+    // "91002": the 9 gets stripped, so the device 1002 rings.
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite_bytes("1001", "91002", "route-strip", "192.0.2.1:10002"),
+    );
+    let callee_invite = request_of(&outputs, Method::Invite);
+    let to = header_value(&callee_invite.headers, "to").unwrap();
+    assert!(to.contains("1002"), "9-prefix stripped: {to}");
+
+    // "1999" is refused outright and logged.
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite_bytes("1001", "1999", "route-reject", "192.0.2.1:10004"),
+    );
+    assert_eq!(response_of(&outputs, 403).status, 403, "{outputs:?}");
+    let logs = call_logs(&outputs);
+    assert!(logs[0].contains("\"result\":\"restricted\""), "{}", logs[0]);
+
+    // An unmatched number falls through to the plain lookup (404 here).
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite_bytes("1001", "7777", "route-none", "192.0.2.1:10006"),
+    );
+    assert_eq!(response_of(&outputs, 404).status, 404);
 }
 
 // ----- golden rejection tests (docs/07 §4 rule 2) ---------------------------

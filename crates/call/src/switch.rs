@@ -24,6 +24,7 @@ use sip_syntax::{canonical_header, parse_sdp, Header, Message, Method, Request, 
 
 use crate::call::{transit, CallEvent, CallState, Command};
 use crate::registration::{header, number_from_uri, Device, Registrar};
+use crate::routing::{route, Destination, Rule};
 
 /// The methods we implement (docs/07); anything else gets `405` + `Allow`.
 pub const ALLOW: &str = "INVITE, ACK, BYE, CANCEL, REGISTER, OPTIONS";
@@ -45,6 +46,9 @@ pub struct SwitchConfig {
     pub rtp_port_base: u16,
     /// How many media ports are available (two per concurrent call).
     pub rtp_ports: u16,
+    /// Call routing rules, in order (docs/03 §4). Empty = "the dialed number
+    /// rings the device that has it".
+    pub routing: Vec<Rule>,
     /// The devices that may register and be called.
     pub devices: Vec<Device>,
 }
@@ -341,8 +345,7 @@ impl Switch {
             .map(uri_of)
             .and_then(number_from_uri)
             .unwrap_or_default();
-        let callee_number = number_from_uri(&request.uri).unwrap_or_default();
-
+        let dialed = number_from_uri(&request.uri).unwrap_or_default();
         let (mut caller_tx, actions) = ServerTransaction::new(request.clone(), now_ms);
         push_sends(&mut outputs, actions);
 
@@ -369,13 +372,31 @@ impl Switch {
             push_sends(&mut outputs, actions);
             outputs.push(Output::CallLog(call_log_line(
                 &caller_number,
-                &callee_number,
+                &dialed,
                 now_ms,
                 now_ms,
                 "unauthorized",
             )));
             return outputs;
         }
+
+        // Call routing (docs/03 §4): where does this number go?
+        let callee_number = match route(&self.config.routing, &dialed) {
+            Destination::Ring(number) => number,
+            Destination::Reject => {
+                let response = tagged(make_response(&request, 403, "Forbidden"), &self.fresh_tag());
+                let actions = caller_tx.on_response_from_user(response, now_ms);
+                push_sends(&mut outputs, actions);
+                outputs.push(Output::CallLog(call_log_line(
+                    &caller_number,
+                    &dialed,
+                    now_ms,
+                    now_ms,
+                    "restricted",
+                )));
+                return outputs;
+            }
+        };
 
         // Where does the call go?
         let Some(callee_contact) = self
@@ -479,10 +500,20 @@ impl Switch {
             .unwrap_or("")
             .to_string();
 
+        // The callee's address of record is the *routed* number, not whatever
+        // was dialed (docs/03 §4).
+        let callee_aor = format!(
+            "sip:{callee_number}@{}",
+            self.config
+                .pbx_uri
+                .strip_prefix("sip:")
+                .unwrap_or(&self.config.pbx_uri)
+        );
+
         // B2BUA: a brand-new leg toward the callee.
         let our_caller_tag = self.fresh_tag();
         let callee_invite = self.build_callee_invite(
-            &request,
+            &callee_aor,
             &caller_uri,
             &caller_display,
             &callee_contact,
@@ -501,7 +532,7 @@ impl Switch {
 
         let caller_dialog = Dialog::new(
             &caller_call_id,
-            &request.uri, // our side is the address of record being called
+            &callee_aor, // our side is the address of record being called
             &our_caller_tag,
             &caller_uri,
             &caller_tag,
@@ -511,7 +542,7 @@ impl Switch {
             &callee_call_id,
             &caller_uri,
             &callee_from_tag,
-            &request.uri,
+            &callee_aor,
             "",
             &callee_contact,
         );
@@ -1141,13 +1172,12 @@ impl Switch {
 
     fn build_callee_invite(
         &mut self,
-        caller_invite: &Request,
+        callee_aor: &str,
         caller_uri: &str,
         caller_display: &str,
         callee_contact: &str,
         body: Vec<u8>,
     ) -> Request {
-        let callee_aor = caller_invite.uri.clone();
         let from_tag = self.fresh_tag();
         // Caller identity is carried over, display name included.
         let from = if caller_display.is_empty() {

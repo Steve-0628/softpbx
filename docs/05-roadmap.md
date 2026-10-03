@@ -32,11 +32,14 @@ desk phone if one is around). This is where real-world SIP messiness appears.
 cleanly, repeatedly, for hours. (Round 1 + two review rounds done; the phase 7
 hardening list is in [docs/08](08-build-phases.md).)
 
-## Step 3 — Call routing *(phase 8)*
+## Step 3 — Call routing *(phase 8 — done)*
 
-- Routing rules: matching, number rewriting, rejection
+- Routing rules: matching, number rewriting, rejection — `[[routing]]` config,
+  first match wins (docs/03 §4)
 
 **Done when:** rules work on real phones, each backed by simulation tests.
+(Engine, switch integration, config validation and tests are in; a real-phone
+dial-through remains part of the phase 7 checklist.)
 
 Hold/transfer and ring groups are not planned now (docs/01). If they are wanted
 later, they fit after this step as small additions (docs/03 §5–6).

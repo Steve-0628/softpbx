@@ -81,12 +81,20 @@ secret = "change-me"              # what the phone uses to register
 number = "1002"
 name = "Bob"
 secret = "change-me-too"
+
+# Call routing (docs/03 §4): first match wins. Optional — without any
+# [[routing]] sections, a dialed number rings the device that has it.
+[[routing]]
+match = "0"                     # what the caller dialed (* and ? wildcard)
+to = "1001"                     # "dialed", "reject", or a number
+
+[[routing]]
+match = "9*"
+to = "dialed"
+strip = "9"                     # drop the leading 9 before the lookup
 ```
 
-Call routing (rules for where a dialed number goes) is **not built yet**: today
-a dialed number simply rings the device with that number. Routing rules are
-roadmap step 3 (docs/05) and will get their own sections in this file. The
-same goes for future ring groups and trunk definitions.
+Ring groups and trunk targets get their own sections here later.
 
 ## 5. Logging
 
