@@ -108,11 +108,12 @@ impl Pbx {
 
     /// RTP arrived on a relay port: forward it down the other leg.
     async fn handle_rtp(&self, local_port: u16, data: &[u8], source: SocketAddr) {
-        let outputs =
-            self.switch
-                .lock()
-                .expect("lock")
-                .on_rtp(local_port, &source.to_string(), data);
+        let outputs = self.switch.lock().expect("lock").on_rtp(
+            local_port,
+            &source.to_string(),
+            data,
+            self.now_ms(),
+        );
         self.dispatch(outputs, None).await;
     }
 
@@ -120,6 +121,7 @@ impl Pbx {
     /// registrations now and then.
     async fn tick(&self) {
         let now = self.now_ms();
+        self.switch.lock().expect("lock").sweep(now);
         self.switch.lock().expect("lock").expire(now);
         let due: Vec<String> = self
             .switch

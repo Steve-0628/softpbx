@@ -184,9 +184,17 @@ impl FileConfig {
                 }
             }
             if let Some(strip) = &rule.strip {
-                if rule.to != "dialed" {
+                // strip rewrites the dialed number before the destination sees
+                // it: useful with `dialed` ("dial 9 to get out") and with
+                // `trunk:` ("dial 9 + strip 9 → the far PBX").
+                let rewriteable = rule.to == "dialed"
+                    || rule
+                        .to
+                        .strip_prefix("trunk:")
+                        .is_some_and(|name| !name.is_empty());
+                if !rewriteable {
                     bail!(
-                        "routing match \"{}\": strip only makes sense with to = \"dialed\"",
+                        "routing match \"{}\": strip only makes sense with to = \"dialed\" or \"trunk:<name>\"",
                         rule.pattern
                     );
                 }

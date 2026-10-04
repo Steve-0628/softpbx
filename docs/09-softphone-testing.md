@@ -79,14 +79,18 @@ Adversarial probes (the "evil peer" set), all locked as golden tests in
 Harness lessons (why two of these took debugging): test tools must send a
 request *line*, BYEs must carry the *right dialog leg's* tag, and probe
 sockets must be drained between checks — each of these produced a convincing
-"the PBX is broken" symptom that was the harness's own bug. The PBX's own
-failures so far have all been found by tests and reviewers instead.
+"the PBX is broken" symptom that was the harness's own bug. More: sockets
+bound to 127.0.0.1 cannot reach a bridge; Python default arguments bind at
+*def* time (a patched constant changes nothing); a B2BUA has **two
+Call-IDs** and the far side speaks in the callee leg's; and always rebuild
+the binary before runtime experiments (`cargo test` compiles fresh, the
+daemon doesn't). The PBX's own failures have been found by tests and
+reviewers instead.
 
 ## 5. Next rounds
 
-- twinkle as a third phone; a hardphone when one is available
-- The same recipe against a **MikoPBX trunk** (roadmap step 4) — interop
-  findings get recorded here per device
+- a hardphone when one is available (twinkle ✅ done — see §4)
+- the reverse direction (softpbx → MikoPBX) and the rest of the matrix
 
 ## 6. MikoPBX (the trunk peer) — what it actually is
 
@@ -96,7 +100,7 @@ The facts that shape the trunk work:
 
 | Fact | Consequence for us |
 | --- | --- |
-| **No session timers, ever** (`timers=no`; 78 s call with zero mid-dialog traffic) | the scariest interop risk is gone; our `refresher=uac` answer stays but will likely never fire |
+| **No session timers, ever** (`timers=no`; 78 s call with zero mid-dialog traffic) | the scariest interop risk is gone; we never claim session timers at all (docs/07 §3) |
 | No UPDATE, no PRACK, no re-INVITE refresh from it | our SIP subset is closer than feared |
 | It sends **OPTIONS qualify probes every 60 s** | our OPTIONS handling is load-bearing — never break it |
 | **It challenges INVITEs** from authenticated endpoints (401 before call setup) | trunk legs are exempt (IP identify / inbound registration) — the trunk shape avoids this; a future direct-extension dial would need INVITE digest |
@@ -122,7 +126,7 @@ their live rows when the reverse direction (softpbx → MikoPBX) goes up.
 | Behavior | MikoPBX ↔ softpbx | Notes |
 | --- | --- | --- |
 | MikoPBX registers to softpbx (trunk as 1001) | ✅ | re-registers every ~60 s; qop-less digest accepted |
-| **Full site-to-site call** (3001 → `71002` → route strips 7 → trunk → 1002) | ✅ | INVITE→180→200→ACK, `StreamsRunning` on the far side |
+| **Full site-to-site call** (3001 → `71002`; *MikoPBX's* outbound route strips the 7 and delivers to our 1002) | ✅ | registrar path; our own `strip`/`trunk:` routing is simulation-tested so far |
 | RTP relayed both directions | ✅ | real bridge traffic through softpbx's relay ports, byte-transparent |
 | Far-side hang-up (BYE from MikoPBX) | ✅ | our phone tore down; one `completed` call-log line |
 | Caller identity | ⚠️ | arrives as the trunk login (1001) — the documented `username` identity quirk; configure their trunk accordingly when the real caller matters |

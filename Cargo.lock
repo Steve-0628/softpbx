@@ -49,6 +49,7 @@ name = "call"
 version = "0.1.0"
 dependencies = [
  "media",
+ "proptest",
  "rtp",
  "sip-stack",
  "sip-syntax",

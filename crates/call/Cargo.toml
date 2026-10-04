@@ -10,3 +10,6 @@ sip-syntax = { path = "../sip-syntax" }
 sip-stack = { path = "../sip-stack" }
 rtp = { path = "../rtp" }
 media = { path = "../media" }
+
+[dev-dependencies]
+proptest = { workspace = true }

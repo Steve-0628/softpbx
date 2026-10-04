@@ -15,4 +15,4 @@ pub use registration::{
     MAX_EXPIRES_S, MIN_EXPIRES_S,
 };
 pub use routing::{glob_match, route, Action, Destination, Rule};
-pub use switch::{Output, Switch, SwitchConfig, TrunkConfig, ALLOW};
+pub use switch::{Output, Switch, SwitchConfig, TrunkConfig, ALLOW, MEDIA_TIMEOUT_MS};

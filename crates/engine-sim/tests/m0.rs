@@ -647,6 +647,7 @@ fn ac03_audio_flows_without_loss() {
             call.caller_relay_port,
             &call.caller_media,
             packet.to_bytes(),
+            world.now_ms(),
         );
         for (to, data) in rtp_forwards(&outputs) {
             assert_eq!(to, call.callee_media, "Alice's audio goes to Bob");
@@ -661,6 +662,7 @@ fn ac03_audio_flows_without_loss() {
             call.callee_relay_port,
             &call.callee_media,
             packet.to_bytes(),
+            world.now_ms(),
         );
         for (to, data) in rtp_forwards(&outputs) {
             assert_eq!(to, call.caller_media, "Bob's audio goes to Alice");
@@ -677,7 +679,12 @@ fn ac03_audio_flows_without_loss() {
     assert_eq!(last_seq_alice, Some(packets as u16 - 1));
 
     // Garbage is dropped, not forwarded (docs/07).
-    let outputs = switch.on_rtp(call.caller_relay_port, &call.caller_media, b"not rtp");
+    let outputs = switch.on_rtp(
+        call.caller_relay_port,
+        &call.caller_media,
+        b"not rtp",
+        world.now_ms(),
+    );
     assert!(rtp_forwards(&outputs).is_empty());
 }
 
@@ -744,7 +751,12 @@ fn ac04_call_teardown_and_log() {
 
     // Late media for the dead call is dropped, not forwarded.
     let late = Packet::build(false, 0, 1, 160, 7, &[0xff; 80]);
-    let outputs = switch.on_rtp(call.caller_relay_port, &call.caller_media, late.to_bytes());
+    let outputs = switch.on_rtp(
+        call.caller_relay_port,
+        &call.caller_media,
+        late.to_bytes(),
+        world.now_ms(),
+    );
     assert!(rtp_forwards(&outputs).is_empty(), "no leaked media path");
 }
 
@@ -803,6 +815,7 @@ fn ac05_ten_concurrent_calls() {
                 call.caller_relay_port,
                 &call.caller_media,
                 packet.to_bytes(),
+                world.now_ms(),
             );
             for (to, _) in rtp_forwards(&outputs) {
                 assert_eq!(to, call.callee_media);
@@ -813,6 +826,7 @@ fn ac05_ten_concurrent_calls() {
                 call.callee_relay_port,
                 &call.callee_media,
                 packet.to_bytes(),
+                world.now_ms(),
             );
             for (to, _) in rtp_forwards(&outputs) {
                 assert_eq!(to, call.caller_media);
@@ -860,6 +874,7 @@ fn call_scenario_is_deterministic() {
                 call.caller_relay_port,
                 &call.caller_media,
                 packet.to_bytes(),
+                world.now_ms(),
             );
         }
         let _ = feed(
@@ -1401,6 +1416,323 @@ fn golden_require_is_ignored_for_ack_cancel_bye() {
         "the BYE is honored: {outputs:?}"
     );
     assert_eq!(switch.active_calls(), 0, "and the call is down");
+}
+
+// ----- hardening round: reviews 3 findings ----------------------------------
+
+/// Endpoints that die without a BYE must not hold their media ports forever
+/// (the immortal-zombie-call bug).
+#[test]
+fn regression_media_timeout_releases_the_call() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let call = establish_call(
+        &mut world,
+        &mut switch,
+        "harden-zombie",
+        "1001",
+        "1002",
+        "192.0.2.1:10000",
+        "192.0.2.2:20000",
+    );
+    let packet = Packet::build(false, 0, 1, 160, 9, &[0xff; 80]);
+    let _ = switch.on_rtp(
+        call.caller_relay_port,
+        &call.caller_media,
+        packet.to_bytes(),
+        0,
+    );
+
+    // Still alive just before the deadline.
+    assert!(switch.sweep(119_000).is_empty(), "no premature teardown");
+    assert_eq!(switch.active_calls(), 1);
+
+    // Silence for 120 s: the call dies with BYEs on both legs.
+    let outputs = switch.sweep(120_000);
+    assert_eq!(
+        requests_of(&outputs, Method::Bye).len(),
+        2,
+        "both legs are hung up: {outputs:?}"
+    );
+    assert_eq!(switch.active_calls(), 0);
+    let logs = call_logs(&outputs);
+    assert!(
+        logs[0].contains("\"result\":\"media-timeout\""),
+        "{}",
+        logs[0]
+    );
+}
+
+/// Resources come back when calls end: ports and retained records.
+#[test]
+fn regression_resources_released_after_teardown() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch_with_ports(phones(), 4);
+    let before = switch.free_media_ports();
+    register_both(&mut world, &mut switch);
+    let call = establish_call(
+        &mut world,
+        &mut switch,
+        "harden-ports",
+        "1001",
+        "1002",
+        "192.0.2.1:10000",
+        "192.0.2.2:20000",
+    );
+    assert_eq!(
+        switch.free_media_ports(),
+        before - 2,
+        "the call holds two ports"
+    );
+    let _ = feed(
+        &mut world,
+        &mut switch,
+        &bye_bytes(
+            "1001",
+            "sip:192.0.2.10:5060",
+            &call.to_tag,
+            &call.call_id,
+            2,
+        ),
+    );
+    assert_eq!(switch.free_media_ports(), before, "and gives them back");
+    // Once the transactions are done, nothing is retained either.
+    loop {
+        let timers = switch.timers();
+        if timers.is_empty() {
+            break;
+        }
+        for (name, due) in timers {
+            world.arm(name, due);
+        }
+        while let Some(event) = world.next_event() {
+            if let Event::Timer { name } = event {
+                let _ = switch.on_timer(&name, world.now_ms());
+            }
+        }
+    }
+    assert_eq!(switch.retained_calls(), 0);
+    assert_eq!(switch.free_media_ports(), before);
+}
+
+/// A new INVITE reusing a retained call's Call-ID must not be swallowed.
+#[test]
+fn regression_call_id_reuse_is_refused_or_restarted() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let call = establish_call(
+        &mut world,
+        &mut switch,
+        "harden-reuse",
+        "1001",
+        "1002",
+        "192.0.2.1:10000",
+        "192.0.2.2:20000",
+    );
+
+    // Same Call-ID, different transaction (new branch), call still live:
+    // 491 — never silence.
+    let second: Vec<u8> = invite_bytes("1001", "1002", "harden-reuse", "192.0.2.1:10002")
+        .into_iter()
+        .collect();
+    let second = String::from_utf8(second)
+        .unwrap()
+        .replace("z9hG4bK-harden-reuse", "z9hG4bK-harden-reuse-2")
+        .into_bytes();
+    let outputs = feed(&mut world, &mut switch, &second);
+    assert_eq!(
+        response_of(&outputs, 491).status,
+        491,
+        "a live call answers instead of eating the INVITE: {outputs:?}"
+    );
+
+    // After the call is over, the same Call-ID starts a fresh call.
+    let _ = feed(
+        &mut world,
+        &mut switch,
+        &bye_bytes(
+            "1001",
+            "sip:192.0.2.10:5060",
+            &call.to_tag,
+            &call.call_id,
+            2,
+        ),
+    );
+    let third = String::from_utf8(invite_bytes(
+        "1001",
+        "1002",
+        "harden-reuse",
+        "192.0.2.1:10004",
+    ))
+    .unwrap()
+    .replace("z9hG4bK-harden-reuse", "z9hG4bK-harden-reuse-3")
+    .into_bytes();
+    let outputs = feed(&mut world, &mut switch, &third);
+    assert_eq!(
+        requests_of(&outputs, Method::Invite).len(),
+        1,
+        "a reused Call-ID gets a fresh call: {outputs:?}"
+    );
+}
+
+/// An in-dialog INVITE whose dialog is gone gets 481 — never a ghost call.
+#[test]
+fn regression_ghost_reinvite_gets_481() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let call = establish_call(
+        &mut world,
+        &mut switch,
+        "harden-ghost",
+        "1001",
+        "1002",
+        "192.0.2.1:10000",
+        "192.0.2.2:20000",
+    );
+    let _ = feed(
+        &mut world,
+        &mut switch,
+        &bye_bytes(
+            "1001",
+            "sip:192.0.2.10:5060",
+            &call.to_tag,
+            &call.call_id,
+            2,
+        ),
+    );
+    // Drain everything so the call is truly gone.
+    loop {
+        let timers = switch.timers();
+        if timers.is_empty() {
+            break;
+        }
+        for (name, due) in timers {
+            world.arm(name, due);
+        }
+        while let Some(event) = world.next_event() {
+            if let Event::Timer { name } = event {
+                let _ = switch.on_timer(&name, world.now_ms());
+            }
+        }
+    }
+    // A late session refresh from the dead dialog.
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &reinvite_bytes(
+            &call.call_id,
+            "1001",
+            "from1",
+            &call.to_tag,
+            9,
+            "192.0.2.1:10006",
+        ),
+    );
+    assert_eq!(
+        response_of(&outputs, 481).status,
+        481,
+        "no ghost calls: {outputs:?}"
+    );
+    assert_eq!(switch.active_calls(), 0);
+}
+
+/// A hold (declined stream) stops the media and gets a declined answer.
+#[test]
+fn regression_hold_stops_media() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let call = establish_call(
+        &mut world,
+        &mut switch,
+        "harden-hold",
+        "1001",
+        "1002",
+        "192.0.2.1:10000",
+        "192.0.2.2:20000",
+    );
+    let hold = reinvite_bytes(&call.call_id, "1001", "from1", &call.to_tag, 2, "0.0.0.0:0");
+    let outputs = feed(&mut world, &mut switch, &hold);
+    let answered = response_of(&outputs, 200);
+    let body = String::from_utf8_lossy(&answered.body);
+    assert!(body.contains("m=audio 0"), "the answer declines: {body}");
+
+    // Nothing is relayed in either direction while held.
+    let packet = Packet::build(false, 0, 1, 160, 9, &[0xff; 80]);
+    let outputs = switch.on_rtp(
+        call.caller_relay_port,
+        &call.caller_media,
+        packet.to_bytes(),
+        0,
+    );
+    assert!(rtp_forwards(&outputs).is_empty(), "held means held");
+    let outputs = switch.on_rtp(
+        call.callee_relay_port,
+        &call.callee_media,
+        packet.to_bytes(),
+        0,
+    );
+    assert!(rtp_forwards(&outputs).is_empty(), "held means held");
+
+    // A resume (active media again) restores the relay.
+    let resume = reinvite_bytes(
+        &call.call_id,
+        "1001",
+        "from1",
+        &call.to_tag,
+        3,
+        "192.0.2.1:11000",
+    );
+    let outputs = feed(&mut world, &mut switch, &resume);
+    assert_eq!(response_of(&outputs, 200).status, 200);
+    let outputs = switch.on_rtp(
+        call.callee_relay_port,
+        &call.callee_media,
+        packet.to_bytes(),
+        0,
+    );
+    let forwards = rtp_forwards(&outputs);
+    assert_eq!(forwards.len(), 1, "resume restores the relay: {outputs:?}");
+    assert_eq!(forwards[0].0, "192.0.2.1:11000", "to the new address");
+}
+
+/// 183 early media carries an SDP — learn it, or the caller is deaf.
+#[test]
+fn regression_183_early_media_is_relayed() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite_bytes("1001", "1002", "harden-early", "192.0.2.1:10000"),
+    );
+    let callee_invite = request_of(&outputs, Method::Invite);
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(
+            &callee_invite,
+            183,
+            "Session Progress",
+            "bob1",
+            &sdp_body("192.0.2.2:21000"),
+        ),
+    );
+    assert_eq!(response_of(&outputs, 183).status, 183, "183 passes through");
+
+    // The callee's early media arrives on our callee-leg relay port (10_002)
+    // and reaches the caller.
+    // Our callee-leg relay port is the one we advertised in the INVITE.
+    let (_, callee_relay_port) = sdp_audio_media(&callee_invite.body).expect("our SDP offer");
+    let packet = Packet::build(false, 0, 1, 160, 9, &[0xff; 80]);
+    let outputs = switch.on_rtp(callee_relay_port, "192.0.2.2:21000", packet.to_bytes(), 0);
+    let forwards = rtp_forwards(&outputs);
+    assert_eq!(forwards.len(), 1, "early media is relayed: {outputs:?}");
+    assert_eq!(forwards[0].0, "192.0.2.1:10000", "to the caller");
 }
 
 // ----- helpers for the regressions ------------------------------------------

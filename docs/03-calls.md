@@ -87,6 +87,10 @@ to = "reject"
 The callee's number, as the callee sees it, is the *routed* number — routing
 decides identity as well as destination.
 
+One trap: rules are **first-match**, so a broad `reject` pattern shadows
+device numbers (`match = "1*"` refuses calls to 1001/1002 as well). Keep
+reject patterns narrow.
+
 Later: ring groups, rules for a fax machine on a gateway port.
 
 ## 5. Hold and transfer (later, not in the first phase)

@@ -31,6 +31,8 @@ pub enum CallEvent {
     CalleeRejected(u16),
     /// The callee never answered.
     CalleeTimeout,
+    /// Media went silent on an answered call (endpoints died without BYE).
+    MediaTimeout,
     /// The caller cancelled while the call was still being set up.
     CallerCancelled,
     /// The caller sent BYE.
@@ -98,6 +100,8 @@ pub fn transit(state: CallState, event: CallEvent) -> (CallState, Vec<Command>) 
             Terminating,
             vec![Command::ByeCaller, Command::CompleteCallee],
         ),
+        // Silence on the wire is how dead endpoints announce themselves.
+        (Answered, MediaTimeout) => (Terminating, vec![Command::ByeCallee, Command::ByeCaller]),
 
         // Teardown is out; the call is over.
         (Terminating, Teardown) => (Terminated, vec![Command::Finish]),

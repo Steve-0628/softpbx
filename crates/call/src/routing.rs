@@ -67,34 +67,35 @@ pub fn route(rules: &[Rule], dialed: &str) -> Destination {
     Destination::Ring(dialed.to_string())
 }
 
-/// Glob matching: `*` = any run (including empty), `?` = one byte. Linear
-/// backtracking (one star at a time) — no exponential blowup on hostile
-/// patterns or long dialed strings.
+/// Glob matching: `*` = any run (including empty), `?` = one byte. The
+/// classic single-star-backtrack matcher: linear-ish (O(n·m) worst case),
+/// no exponential blowup on hostile patterns.
 pub fn glob_match(pattern: &str, value: &str) -> bool {
-    let (mut p, mut v) = (pattern.as_bytes(), value.as_bytes());
-    let (mut star, mut retry) = (None, 0);
-    while !v.is_empty() {
-        match p.first() {
-            Some(&b'*') => {
-                star = Some(p);
-                p = &p[1..];
-                retry = 0;
-            }
-            Some(&b'?') | Some(_) if !p.is_empty() && (p[0] == b'?' || p[0] == v[0]) => {
-                p = &p[1..];
-                v = &v[1..];
-            }
-            _ => match star {
-                Some(star_pattern) => {
-                    retry += 1;
-                    p = &star_pattern[1..];
-                    v = &value.as_bytes()[retry..];
-                }
-                None => return false,
-            },
+    let p = pattern.as_bytes();
+    let v = value.as_bytes();
+    let (mut pi, mut vi) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while vi < v.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == v[vi]) {
+            pi += 1;
+            vi += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = Some(pi);
+            mark = vi;
+            pi += 1;
+        } else if let Some(star_at) = star {
+            // Backtrack to the last star and let it eat one more byte.
+            pi = star_at + 1;
+            mark += 1;
+            vi = mark;
+        } else {
+            return false;
         }
     }
-    p.iter().all(|&c| c == b'*')
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 #[cfg(test)]

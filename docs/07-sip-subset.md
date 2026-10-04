@@ -57,9 +57,11 @@ for now: hold and transfer are not in the first phase, docs/01.)
 - Digest authentication (MD5, with and without `qop`): `REGISTER` is
   challenged, wrong password → `401`, unknown number → `403`. Only nonces we
   issued verify within a five-minute window, so a sniffed response cannot be replayed.
-- **Only registered devices may place calls**: an `INVITE` whose caller has no
-  live binding gets `403`. (No digest challenge on `INVITE` itself — being
-  registered is the admission ticket.)
+- **Only registered devices may place calls** — and trunk peers, which are
+  identified by their address and do not register: an `INVITE` whose caller
+  has no live binding gets `403`, unless it comes from a configured trunk
+  (whose callers may be anyone except *our own* numbers in our domain —
+  impersonation gets `403` too).
 
 ### NAT hygiene
 - `rport` / `received` (RFC 3581) processing is not implemented — instead,
@@ -68,20 +70,25 @@ for now: hold and transfer are not in the first phase, docs/01.)
 
 ### Offer/answer and SDP
 - The RFC 3264 exchange, once per call leg (we re-originate both sides).
-- SDP subset: media line, connection line, `a=rtpmap` for **G.711 (PCMU/PCMA)**
-  and `a=rtpmap`/`a=fmtp` for **telephone-event**, and `a=ptime`.
+- SDP subset: we *parse* the media and connection lines (`m=`, `c=`) and
+  match codecs by payload type; we *emit* `a=rtpmap` for **G.711 (PCMU/PCMA)**
+  and **telephone-event**, `a=ptime`, `a=silenceSupp:off`.
 - Unknown SDP lines and attributes — including direction attributes — are
   ignored. Unknown codecs are not offered and are declined in answers.
-- re-INVITE that phones occasionally send mid-call (codec refresh, device
-  quirks): accepted and answered with the current session unchanged.
+- re-INVITE that phones occasionally send mid-call (codec refresh, session
+  refresh, quirks): accepted and answered. A media move in the offer moves our
+  relay target; a declined stream (`c=0.0.0.0` / `m=audio 0`) pauses the relay
+  in both directions until an active offer resumes it.
 
 ### Response codes we use
 
 Originated by us: `100` (auto), `180`/`183` (callee progress, forwarded with
-its real code), `200`, `400`, `401`, `403`, `404`, `405`, `408`, `481`, `487`,
-`488`, `503`. Final responses from the callee are forwarded as-is (a `486`
-from a busy phone arrives as `486`). `491` and `500` are defined for later use.
-Nothing else needs to exist in the code.
+its real code), `200`, `400`, `401`, `403`, `404`, `405`, `408`, `420`, `481`,
+`487`, `488`, `491`, `503`. Most final responses from the callee reach the
+caller with the same code (a `486` from a busy phone arrives as `486`); the
+exceptions are `401`/`407`, which become `503` (their challenge died with the
+callee leg), and reason phrases are regenerated. Nothing else needs to exist
+in the code.
 
 ## 2. Not implemented (on purpose)
 
@@ -114,7 +121,7 @@ Rejected with a standard error response or ignored:
 | Parallel forking (several early dialogs per call) | Ring groups being wanted (docs/03 §6) |
 | `INFO` + RFC 4733 telephone-event handling (DTMF) | Any feature that consumes DTMF; analog gateways |
 | `UPDATE` as a refresh mechanism | A peer that refreshes with UPDATE (the MikoPBX capture shows none ever does; re-INVITE refreshes already work) |
-| Session timers (RFC 4028) | A peer that turns out to need them. Policy: **we never claim the extension** — an INVITE carrying `Session-Expires` is answered *without* it (the peer then runs no timer or self-refreshes), and `Require: timer` gets `420` like anything unsupported. This is coherent with "never half an extension": claiming `refresher=uac` over a UAC's `refresher=uas` would violate §9 Table 2, and implementing the UAS side obliges us to refresh. (MikoPBX, our actual peer, never sends session timers at all.) |
+| Session timers (RFC 4028) | A peer that turns out to need them. Policy: **we never claim the extension** — an INVITE carrying `Session-Expires` is answered *without* it (the peer then runs no timer or self-refreshes), and `Require: timer` gets `420` like anything unsupported. This is coherent with "never half an extension": claiming `refresher=uac` over a UAC's `refresher=uas` would violate §9 Table 2, and implementing the UAS side obliges us to refresh. (MikoPBX, our actual peer, sends none — one peer's capture, not a law of nature.) |
 | TCP transport | A real device that cannot do UDP (none expected at this size) |
 | `183` early media handling | Trunk or gateway interop shows it matters |
 | Direction attributes (`sendonly` etc.) | Hold / music-on-hold |

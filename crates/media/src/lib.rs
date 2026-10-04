@@ -79,6 +79,19 @@ pub fn audio_sdp_answer(connection_ip: &str, port: u16, offered_payload_types: &
     build_sdp(connection_ip, port, &shared)
 }
 
+/// An SDP body declining media (RFC 3264 §6: `m=audio 0`).
+pub fn declined_sdp(connection_ip: &str) -> Vec<u8> {
+    format!(
+        "v=0\r\n\
+         o=softpbx 1 1 IN IP4 {connection_ip}\r\n\
+         s=-\r\n\
+         c=IN IP4 {connection_ip}\r\n\
+         t=0 0\r\n\
+         m=audio 0 RTP/AVP 0\r\n\r\n"
+    )
+    .into_bytes()
+}
+
 fn build_sdp(connection_ip: &str, port: u16, codecs: &[Codec]) -> Vec<u8> {
     let payload_types: Vec<String> = codecs
         .iter()

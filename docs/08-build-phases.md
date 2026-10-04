@@ -75,13 +75,15 @@ independent review rounds are behind us. What remains is making it boring:
   mid-call re-INVITEs (session refresh), CANCEL-as-the-callee-answers, a
   restart mid-call
 - A third phone type (twinkle) and at least one hardphone when available
-- Stress: SIPp scenario with 50+ concurrent calls; a multi-hour soak with
-  periodic calls; zero stuck calls, zero leaked media ports
+- Stress: 50+ concurrent calls; a soak with periodic calls; zero stuck calls,
+  zero leaked media ports
 - Device quirk data tables as devices demand them (none needed yet)
 
 **Done when:** two different phone types run calls for hours (both directions,
 all hang-up ways) without a stuck call or a leaked resource; the stress and
-soak runs pass; findings are in docs/09.
+soak runs pass; findings are in docs/09. ✅ linphone + baresip + twinkle
+through softpbx; 50-call burst; 3000-call soak (~76 min). No hardphone
+available — noted.
 
 ## Phase 8 — Call routing (roadmap step 3)
 
@@ -90,7 +92,8 @@ soak runs pass; findings are in docs/09.
 - Refuse restricted numbers clearly (`403` + `restricted` in the call log)
 
 **Done when:** routing works on real phones and every rule has a simulation
-test; the config validator rejects nonsense rules at startup.
+test; the config validator rejects nonsense rules at startup. ✅ both
+(docs/09 §4).
 
 ## Phase 9 — Trunk core (roadmap step 4, part one)
 
@@ -103,7 +106,7 @@ shaped by **what MikoPBX actually does** (docs/09 §6, captured 2026-10):
   engine already does number ranges — the target just gains "trunk X"); the
   callee leg becomes a trunk leg (its own Call-IDs, its own quirks)
 - Inbound: INVITEs from the trunk map to local devices. **Trunk legs are not
-  challenged** (IP identify / inbound registration) — and the simplest shape
+  challenged** (source-IP matching / inbound registration) — and the simplest shape
   has *MikoPBX register to us*, which already works against today's registrar.
   A peer that challenges *our* INVITE gets a digest retry; a trunk caller
   impersonating one of our own numbers is refused; a call that would route

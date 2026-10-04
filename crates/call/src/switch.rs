@@ -14,7 +14,7 @@
 //! garbage-collects calls whose transactions have all finished (typically
 //! ~32 s after the call ends).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
 use sip_stack::{
@@ -26,6 +26,9 @@ use sip_syntax::{canonical_header, parse_sdp, Header, Message, Method, Request, 
 use crate::call::{transit, CallEvent, CallState, Command};
 use crate::registration::{header, number_from_uri, Device, Registrar};
 use crate::routing::{route, Destination, Rule};
+
+/// How long a call may go without media before we call it dead (docs/04).
+pub const MEDIA_TIMEOUT_MS: u64 = 120_000;
 
 /// The methods we implement (docs/07); anything else gets `405` + `Allow`.
 pub const ALLOW: &str = "INVITE, ACK, BYE, CANCEL, REGISTER, OPTIONS";
@@ -126,6 +129,8 @@ impl LegMedia {
 struct CallMedia {
     caller: LegMedia,
     callee: LegMedia,
+    /// A declined stream (hold) stops the relay in both directions.
+    paused: bool,
 }
 
 #[derive(Debug)]
@@ -148,6 +153,8 @@ struct CallCtx {
     auth_retried: bool,
     /// Our ACK for the callee's 2xx; re-sent if they retransmit it.
     callee_ack: Option<Request>,
+    /// When media last flowed (for the inactivity sweep).
+    last_media_ms: u64,
     /// Server transactions for in-dialog requests we received (BYE, re-INVITE).
     server_txs: Vec<ServerTransaction>,
     /// Client transactions for requests we sent besides the INVITE (BYE, CANCEL).
@@ -162,9 +169,9 @@ struct CallCtx {
 pub struct Switch {
     config: SwitchConfig,
     registrar: Registrar,
-    calls: HashMap<u64, CallCtx>,
+    calls: BTreeMap<u64, CallCtx>,
     /// Both legs' Call-IDs → call.
-    by_call_id: HashMap<String, u64>,
+    by_call_id: BTreeMap<String, u64>,
     next_tag: u64,
     next_call: u64,
     next_branch: u64,
@@ -180,8 +187,8 @@ impl Switch {
         Switch {
             config,
             registrar,
-            calls: HashMap::new(),
-            by_call_id: HashMap::new(),
+            calls: BTreeMap::new(),
+            by_call_id: BTreeMap::new(),
             next_tag: 0,
             next_call: 0,
             next_branch: 0,
@@ -192,6 +199,38 @@ impl Switch {
     /// Drops expired registrations (call occasionally; cheap).
     pub fn expire(&mut self, now_ms: u64) {
         self.registrar.expire(now_ms);
+    }
+
+    /// Tears down calls whose media went silent: endpoints that die without a
+    /// BYE must not hold their relay ports forever (docs/04 "no leaks").
+    /// Mirrors the peer-side `rtp_timeout` behavior we saw on MikoPBX.
+    pub fn sweep(&mut self, now_ms: u64) -> Vec<Output> {
+        let stale: Vec<u64> = self
+            .calls
+            .iter()
+            .filter(|(_, call)| {
+                call.state == CallState::Answered
+                    && call.media.is_some()
+                    && now_ms.saturating_sub(call.last_media_ms) >= MEDIA_TIMEOUT_MS
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        let mut outputs = Vec::new();
+        for id in stale {
+            if let Some(call) = self.calls.get_mut(&id) {
+                call.outcome = "media-timeout".to_string();
+            }
+            let actions = self.event_on(&id, CallEvent::MediaTimeout, now_ms);
+            outputs.extend(self.apply_actions(&id, actions, now_ms));
+            outputs.extend(self.settle(&id, now_ms));
+        }
+        self.gc();
+        outputs
+    }
+
+    /// How many media ports are still free (leak checks in tests).
+    pub fn free_media_ports(&self) -> usize {
+        self.free_rtp_ports.len()
     }
 
     /// Currently registered numbers.
@@ -253,6 +292,35 @@ impl Switch {
         let Some(call) = self.calls.get_mut(&id) else {
             return vec![];
         };
+        // Ignore stale timer names: the transaction may have moved on (an auth
+        // retry swaps it out from under a pending tick).
+        let fresh = match slot {
+            TxSlot::Caller => call.caller_tx.next_timer().map(|(_, t)| t) == Some(timer),
+            TxSlot::Callee => {
+                call.callee_tx
+                    .as_ref()
+                    .and_then(|tx| tx.next_timer())
+                    .map(|(_, t)| t)
+                    == Some(timer)
+            }
+            TxSlot::Server(index) => {
+                call.server_txs
+                    .get(index)
+                    .and_then(|tx| tx.next_timer())
+                    .map(|(_, t)| t)
+                    == Some(timer)
+            }
+            TxSlot::Client(index) => {
+                call.client_txs
+                    .get(index)
+                    .and_then(|tx| tx.next_timer())
+                    .map(|(_, t)| t)
+                    == Some(timer)
+            }
+        };
+        if !fresh {
+            return vec![];
+        }
         let actions = match slot {
             TxSlot::Caller => call.caller_tx.on_timer(timer, now_ms),
             TxSlot::Callee => call
@@ -294,9 +362,13 @@ impl Switch {
         outputs
     }
 
-    /// Whether this address is one of our trunk peers.
+    /// Whether this address belongs to one of our trunk peers (by IP: the
+    /// port is where we *send*, not who they are — NAT rewrites source ports).
     pub fn is_trunk_peer(&self, address: SocketAddr) -> bool {
-        self.config.trunks.iter().any(|trunk| trunk.peer == address)
+        self.config
+            .trunks
+            .iter()
+            .any(|trunk| trunk.peer.ip() == address.ip())
     }
 
     /// Runs the final transition on every call that reached `Terminating`.
@@ -354,6 +426,16 @@ impl Switch {
             Method::Invite if self.find_leg(&request).is_some() => {
                 self.handle_reinvite(request, now_ms)
             }
+            // An INVITE that *looks* in-dialog (To has a tag) but whose dialog
+            // is gone gets 481 — it must never re-ring a number.
+            Method::Invite if header(&request.headers, "to").and_then(tag_of).is_some() => self
+                .refuse(
+                    &request,
+                    481,
+                    "Call/Transaction Does Not Exist",
+                    None,
+                    now_ms,
+                ),
             Method::Invite => self.handle_invite(request, now_ms, from),
             Method::Ack => self.handle_ack(request, now_ms),
             Method::Bye => self.handle_bye(request, now_ms),
@@ -406,14 +488,28 @@ impl Switch {
             .unwrap_or("")
             .to_string();
 
-        // Retransmission of an INVITE whose call we still hold: repeat our
-        // last response instead of starting a second call.
+        // Same Call-ID as something we know?
         if let Some(&id) = self.by_call_id.get(&caller_call_id) {
-            if let Some(call) = self.calls.get_mut(&id) {
+            let Some(call) = self.calls.get_mut(&id) else {
+                return outputs;
+            };
+            let same_transaction = call.caller_tx.branch().is_some()
+                && call.caller_tx.branch() == sip_stack::branch(&request.headers);
+            if same_transaction {
+                // Retransmission: repeat our last response, never re-ring.
                 let actions = call.caller_tx.on_request(&request);
                 push_sends(&mut outputs, actions);
+                return outputs;
             }
-            return outputs;
+            if call.state != CallState::Terminated {
+                // A live call and a different transaction: refuse politely —
+                // never silence.
+                return self.refuse(&request, 491, "Request Pending", None, now_ms);
+            }
+            // A stale retained call whose Call-ID is being reused: drop it and
+            // treat this as a brand-new call.
+            self.by_call_id.remove(&caller_call_id);
+            self.calls.remove(&id);
         }
 
         let caller_number = header(&request.headers, "from")
@@ -454,12 +550,16 @@ impl Switch {
             let from_host = header(&request.headers, "from")
                 .map(uri_of)
                 .and_then(|uri| uri.rsplit('@').next())
+                .map(|host| host.split(':').next().unwrap_or(host))
                 .unwrap_or("");
             let our_host = self
                 .config
                 .pbx_uri
                 .strip_prefix("sip:")
-                .unwrap_or(&self.config.pbx_uri);
+                .unwrap_or(&self.config.pbx_uri)
+                .split(':')
+                .next()
+                .unwrap_or("");
             if from_host == our_host
                 && self
                     .config
@@ -552,7 +652,7 @@ impl Switch {
                             self.config
                                 .trunks
                                 .iter()
-                                .any(|trunk| trunk.name == name && trunk.peer == address)
+                                .any(|trunk| trunk.name == name && trunk.peer.ip() == address.ip())
                         })
                         .unwrap_or(false)
                     {
@@ -635,6 +735,7 @@ impl Switch {
                         peer_addr: String::new(),
                         learned: None,
                     },
+                    paused: false,
                 }),
                 None => {
                     let response = tagged(
@@ -744,6 +845,7 @@ impl Switch {
                 callee_trunk,
                 auth_retried: false,
                 callee_ack: None,
+                last_media_ms: now_ms,
                 server_txs: Vec::new(),
                 client_txs: Vec::new(),
                 media,
@@ -789,20 +891,40 @@ impl Switch {
             (dialog.local_tag.clone(), port)
         };
 
+        // A re-INVITE may also move their signaling target (Contact).
+        if let Some(contact) = header(&request.headers, "contact") {
+            let target = uri_of(contact).to_string();
+            if !target.is_empty() {
+                if let Some(call) = self.calls.get_mut(&id) {
+                    match leg {
+                        Leg::Caller => call.caller_dialog.remote_target = target,
+                        Leg::Callee => {
+                            if let Some(dialog) = call.callee_dialog.as_mut() {
+                                dialog.remote_target = target;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // A re-INVITE that moves media moves our relay target with it
         // (RFC 3264); a declined stream (port 0 / c=0.0.0.0) stops it.
         if !request.body.is_empty() {
             let moved = media_target(&request.body);
-            let declined = media_declined(&request.body);
+            let declined = declined_media(&request.body);
             if moved.is_some() || declined {
                 if let Some(call) = self.calls.get_mut(&id) {
                     if let Some(media) = call.media.as_mut() {
+                        media.paused = declined;
                         let leg = match leg {
                             Leg::Caller => &mut media.caller,
                             Leg::Callee => &mut media.callee,
                         };
-                        leg.peer_addr = moved.unwrap_or_default();
-                        leg.learned = None;
+                        if let Some(address) = moved {
+                            leg.peer_addr = address;
+                            leg.learned = None;
+                        }
                     }
                 }
             }
@@ -810,7 +932,14 @@ impl Switch {
 
         let mut response = tagged(make_response(&request, 200, "OK"), &our_tag);
         if !request.body.is_empty() {
-            if let Some(port) = our_port {
+            if declined_media(&request.body) {
+                // A declined stream gets a declined answer (RFC 3264 §6).
+                response.headers.push(Header {
+                    name: "Content-Type".to_string(),
+                    value: "application/sdp".to_string(),
+                });
+                response.body = media::declined_sdp(&self.config.rtp_host);
+            } else if let Some(port) = our_port {
                 let offered = sdp_payload_types(&request.body);
                 response.headers.push(Header {
                     name: "Content-Type".to_string(),
@@ -1021,7 +1150,7 @@ impl Switch {
     ///
     /// The transparent pipe (docs/02 §8): the packet's bytes go out unchanged.
     /// Garbage in, nothing out.
-    pub fn on_rtp(&mut self, local_port: u16, from: &str, data: &[u8]) -> Vec<Output> {
+    pub fn on_rtp(&mut self, local_port: u16, from: &str, data: &[u8], now_ms: u64) -> Vec<Output> {
         let Ok(packet) = rtp::Packet::parse(data) else {
             return vec![];
         };
@@ -1031,9 +1160,13 @@ impl Switch {
         let Some(call) = self.calls.get_mut(&id) else {
             return vec![];
         };
+        call.last_media_ms = now_ms;
         let Some(media) = call.media.as_mut() else {
             return vec![];
         };
+        if media.paused {
+            return vec![]; // the call is on hold: silence on purpose
+        }
         let (source, target) = match leg {
             Leg::Caller => (&mut media.caller, &media.callee),
             Leg::Callee => (&mut media.callee, &media.caller),
@@ -1094,11 +1227,12 @@ impl Switch {
                                     dialog.remote_target = uri_of(contact).to_string();
                                 }
                             }
-                            // Where their media lives (from their SDP).
-                            if let Some(peer_addr) = media_target(&response.body) {
-                                if let Some(media) = call.media.as_mut() {
-                                    media.callee.peer_addr = peer_addr;
-                                }
+                        }
+                        // Where their media lives (from their SDP) — including
+                        // 183 early media (docs/06: inband announcements).
+                        if let Some(peer_addr) = media_target(&response.body) {
+                            if let Some(media) = call.media.as_mut() {
+                                media.callee.peer_addr = peer_addr;
                             }
                         }
                     }
@@ -1182,7 +1316,12 @@ impl Switch {
         response: &Response,
         now_ms: u64,
     ) -> Option<Vec<Output>> {
-        let challenge = header(&response.headers, "www-authenticate")?;
+        let challenge = if response.status == 407 {
+            header(&response.headers, "proxy-authenticate")
+                .or_else(|| header(&response.headers, "www-authenticate"))?
+        } else {
+            header(&response.headers, "www-authenticate")?
+        };
         let call = self.calls.get(id)?;
         if call.auth_retried || !matches!(call.state, CallState::Offering | CallState::Ringing) {
             return None;
@@ -1194,6 +1333,17 @@ impl Switch {
             (trunk.username.clone()?, trunk.secret.clone()?)
         };
         let challenge = sip_stack::digest::parse_challenge(challenge)?;
+        // qop negotiation: we answer qop=auth, or nothing at all.
+        if let Some(qop) = &challenge.qop {
+            if !qop.split(',').any(|q| q.trim() == "auth") {
+                return None;
+            }
+        }
+        let auth_header = if response.status == 407 {
+            "Proxy-Authorization"
+        } else {
+            "Authorization"
+        };
         let mut retry = invite;
         // A retry is a new transaction: fresh Via branch, next CSeq.
         let cseq = header(&retry.headers, "cseq")
@@ -1212,7 +1362,7 @@ impl Switch {
             &challenge, &username, &secret, "INVITE", &retry.uri,
         );
         retry.headers.push(Header {
-            name: "Authorization".to_string(),
+            name: auth_header.to_string(),
             value,
         });
         let (transaction, actions) = ClientTransaction::new(retry.clone(), now_ms);
@@ -1220,6 +1370,11 @@ impl Switch {
             call.auth_retried = true;
             call.callee_invite = Some(retry);
             call.callee_tx = Some(transaction);
+            // The retry took a CSeq number: the dialog must not reuse it
+            // (RFC 3261 §12.2.1.1) or our later BYE would collide.
+            if let Some(dialog) = call.callee_dialog.as_mut() {
+                dialog.local_cseq = cseq;
+            }
         }
         let mut outputs = Vec::new();
         push_sends(&mut outputs, actions);
@@ -1565,7 +1720,7 @@ fn unsupported_require(request: &Request) -> Vec<String> {
 
 /// Whether an SDP body declines its media (RFC 3264: `m=audio 0` or
 /// `c=0.0.0.0`).
-fn media_declined(body: &[u8]) -> bool {
+fn declined_media(body: &[u8]) -> bool {
     let Ok(sdp) = parse_sdp(body) else {
         return false;
     };
@@ -1605,6 +1760,9 @@ fn media_target(body: &[u8]) -> Option<String> {
     let connection = audio.connection.as_ref()?;
     if connection.is_empty() || audio.port == 0 {
         return None;
+    }
+    if connection == "0.0.0.0" {
+        return None; // hold: media is off (RFC 3264 §6)
     }
     Some(format!("{connection}:{}", audio.port))
 }

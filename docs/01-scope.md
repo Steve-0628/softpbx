@@ -59,7 +59,7 @@ re-register within a minute — that is the accepted failure model.
 | --- | --- |
 | Audio quality | No dropped audio under normal LAN conditions; low added latency |
 | Audio transparency | The audio path must stay usable for future fax/modem traffic: no DSP on the forwarded stream (no VAD, no packet-loss concealment, no AGC). This is a design constraint from day one, even though those features come later |
-| Reliability | Restart after a crash in seconds; no manual cleanup needed |
+| Reliability | Restart after a crash in seconds; no manual cleanup needed. Calls drop and phones re-register on their own interval (30–3600 s) |
 | Operability | Logs good enough to answer "why did that call fail?" |
 | Compatibility | Works with common SIP phones; interop quirks handled per device via data tables |
 | Security | Password authentication for registrations; runs on a trusted network |

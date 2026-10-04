@@ -51,6 +51,8 @@ and `rtp`. Nothing depends on `engine-sim`.
   now.
 - **State is memory-only.** Registrations expire and re-register; calls are
   rebuilt from nothing after a restart. Nothing is persisted except logs.
+- A call whose media goes silent for two minutes is torn down (BYE both ways)
+  — endpoints that die without a BYE must not hold their relay ports.
 
 ## 4. Configuration
 
@@ -86,7 +88,7 @@ secret = "change-me-too"
 # [[routing]] sections, a dialed number rings the device that has it.
 [[routing]]
 match = "0"                     # what the caller dialed (* and ? wildcard)
-to = "1001"                     # "dialed", "reject", or a number
+to = "1001"                     # "dialed", "reject", "trunk:<name>", or a number
 
 [[routing]]
 match = "9*"
@@ -100,7 +102,13 @@ to = "trunk:mikopbx"
 [[trunk]]
 name = "mikopbx"                # the peer routes the number itself
 peer = "192.168.77.108:5060"
+# username = "trunkuser"        # digest credentials, for peers that
+# secret = "trunkpass"          # challenge our INVITEs (both or neither)
 ```
+
+One trap worth knowing: rules are **first-match**, so a broad `reject`
+pattern silently shadows device numbers (`1*` blocks 1001/1002 too). Keep
+reject patterns narrow.
 
 Ring groups and trunk targets get their own sections here later.
 
@@ -120,7 +128,9 @@ Ring groups and trunk targets get their own sections here later.
 The system runs on a trusted office network or VPN. What we still do:
 
 - Digest authentication for phone registrations: without the right password a
-  device cannot register. Call admission then requires a live registration.
+  device cannot register. Call admission then requires a live registration —
+  or being a configured trunk peer (trunk peers are identified by address and
+  do not register).
 - Clear refusal of malformed or oversized SIP messages (no panics, no unbounded
   memory growth).
 - No remote management surface at all, which is the simplest possible attack
@@ -144,7 +154,7 @@ beyond basic sanity limits.
 | Database | A config file and a log file are enough at this scale |
 | Management API / UI | Config is a file; state is inspected in logs |
 | Desired-state config management | "Write the file, restart" is a complete workflow |
-| High availability | A crashed daemon restarts in seconds; calls re-establish |
+| High availability | A crashed daemon restarts in seconds; dropped calls stay dropped (phones re-register, people redial) |
 | Real-time media engineering | Tens of G.711 calls do not justify it |
 | Conference, recording, billing | Out of scope (docs/01) |
 

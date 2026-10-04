@@ -38,8 +38,8 @@ hardening list is in [docs/08](08-build-phases.md).)
   first match wins (docs/03 §4)
 
 **Done when:** rules work on real phones, each backed by simulation tests.
-(Engine, switch integration, config validation and tests are in; a real-phone
-dial-through remains part of the phase 7 checklist.)
+✅ verified over real phones: `0` → operator, `91002` → strip → device,
+`1999` → refused (docs/09 §4).
 
 Hold/transfer and ring groups are not planned now (docs/01). If they are wanted
 later, they fit after this step as small additions (docs/03 §5–6).
