@@ -55,16 +55,21 @@ pub fn audio_sdp(connection_ip: &str, port: u16) -> Vec<u8> {
     build_sdp(connection_ip, port, &OUR_CODECS)
 }
 
+/// Our codecs, narrowed to the payload types a peer's SDP listed.
+fn shared_codecs(offered_payload_types: &[u8]) -> Vec<Codec> {
+    OUR_CODECS
+        .iter()
+        .copied()
+        .filter(|codec| offered_payload_types.contains(&codec.payload_type()))
+        .collect()
+}
+
 /// Builds an SDP answer limited to the codecs the offer actually contained
 /// (RFC 3264 §6: answer with the intersection, never a codec they did not
 /// offer). If the offer shares none of ours, the stream is **declined**
 /// (`m=audio 0`) instead of answered with something they never offered.
 pub fn audio_sdp_answer(connection_ip: &str, port: u16, offered_payload_types: &[u8]) -> Vec<u8> {
-    let shared: Vec<Codec> = OUR_CODECS
-        .iter()
-        .copied()
-        .filter(|codec| offered_payload_types.contains(&codec.payload_type()))
-        .collect();
+    let shared = shared_codecs(offered_payload_types);
     if shared.is_empty() {
         return format!(
             "v=0\r\n\
@@ -75,6 +80,26 @@ pub fn audio_sdp_answer(connection_ip: &str, port: u16, offered_payload_types: &
              m=audio 0 RTP/AVP 0\r\n\r\n"
         )
         .into_bytes();
+    }
+    build_sdp(connection_ip, port, &shared)
+}
+
+/// Builds the SDP offer toward the far leg of a bridge, limited to the codecs
+/// the near leg offered and we support. RTP is relayed without transcoding
+/// (docs/02 §8), so both legs must end up on one codec: offering our whole set
+/// here would let the far leg pick something the near leg never offered.
+///
+/// With nothing to mirror (an offer that listed no payload types we know) we
+/// fall back to our own set; the answer side then still enforces the
+/// intersection.
+pub fn audio_sdp_offer(
+    connection_ip: &str,
+    port: u16,
+    near_end_payload_types: &[u8],
+) -> Vec<u8> {
+    let shared = shared_codecs(near_end_payload_types);
+    if shared.is_empty() {
+        return audio_sdp(connection_ip, port);
     }
     build_sdp(connection_ip, port, &shared)
 }

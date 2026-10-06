@@ -129,8 +129,27 @@ impl LegMedia {
 struct CallMedia {
     caller: LegMedia,
     callee: LegMedia,
+    /// Payload types the callee's answer committed the bridge to. Both legs
+    /// must run the same codec: the relay does not transcode (docs/02 §8).
+    callee_payloads: Vec<u8>,
     /// A declined stream (hold) stops the relay in both directions.
     paused: bool,
+}
+
+impl CallMedia {
+    /// The payload types an answer toward the caller may contain: never wider
+    /// than what the callee's answer committed to (RFC 3264 §6 still applies —
+    /// and a codec the callee refused would be relayed as garbage).
+    fn answerable_payloads(&self, offered: Vec<u8>) -> Vec<u8> {
+        if self.callee_payloads.is_empty() {
+            offered
+        } else {
+            offered
+                .into_iter()
+                .filter(|pt| self.callee_payloads.contains(pt))
+                .collect()
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -738,6 +757,7 @@ impl Switch {
                         peer_addr: String::new(),
                         learned: None,
                     },
+                    callee_payloads: Vec::new(),
                     paused: false,
                 }),
                 None => {
@@ -759,8 +779,13 @@ impl Switch {
             },
             None => None,
         };
+        // Both legs must end up on one codec (the relay does not transcode),
+        // so the offer toward the callee is what the caller offered, narrowed
+        // to what we support — never our full set.
         let callee_body = match &media {
-            Some(media) => media::audio_sdp(&self.config.rtp_host, media.callee.our_port),
+            Some(media) => {
+                media::audio_sdp_offer(&self.config.rtp_host, media.callee.our_port, &offered)
+            }
             None => Vec::new(),
         };
 
@@ -944,11 +969,17 @@ impl Switch {
                 response.body = media::declined_sdp(&self.config.rtp_host);
             } else if let Some(port) = our_port {
                 let offered = sdp_payload_types(&request.body);
+                // The same rule as the answer at setup: never widen past what
+                // the other leg is running.
+                let answer = match self.calls.get(&id).and_then(|call| call.media.as_ref()) {
+                    Some(media) => media.answerable_payloads(offered),
+                    None => offered,
+                };
                 response.headers.push(Header {
                     name: "Content-Type".to_string(),
                     value: "application/sdp".to_string(),
                 });
-                response.body = media::audio_sdp_answer(&self.config.rtp_host, port, &offered);
+                response.body = media::audio_sdp_answer(&self.config.rtp_host, port, &answer);
             }
         }
         let actions = tx.on_response_from_user(response, now_ms);
@@ -1233,10 +1264,16 @@ impl Switch {
                             }
                         }
                         // Where their media lives (from their SDP) — including
-                        // 183 early media (docs/06: inband announcements).
+                        // 183 early media (docs/06: inband announcements). A
+                        // live stream is also their codec choice, and that pins
+                        // what we may answer toward the caller.
                         if let Some(peer_addr) = media_target(&response.body) {
                             if let Some(media) = call.media.as_mut() {
                                 media.callee.peer_addr = peer_addr;
+                                let payload_types = sdp_payload_types(&response.body);
+                                if !payload_types.is_empty() {
+                                    media.callee_payloads = payload_types;
+                                }
                             }
                         }
                     }
@@ -1445,12 +1482,17 @@ impl Switch {
                 // peer runs the session as it sees fit.
                 if let Some(media) = &call.media {
                     let offered = sdp_payload_types(&call.caller_invite.body);
+                    // Never answer with a codec the callee did not accept: the
+                    // relay does not transcode, so a wider answer would let the
+                    // two legs run different codecs and the audio arrive as
+                    // garbage.
+                    let answer = media.answerable_payloads(offered);
                     response.headers.push(Header {
                         name: "Content-Type".to_string(),
                         value: "application/sdp".to_string(),
                     });
                     response.body =
-                        media::audio_sdp_answer(&rtp_host, media.caller.our_port, &offered);
+                        media::audio_sdp_answer(&rtp_host, media.caller.our_port, &answer);
                 }
                 call.caller_tx.on_response_from_user(response, now_ms)
             }

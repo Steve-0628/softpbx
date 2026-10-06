@@ -164,6 +164,17 @@ fn sdp_audio_media(body: &[u8]) -> Option<(String, u16)> {
     Some((audio.connection.clone()?, audio.port))
 }
 
+/// The payload types an SDP body's audio stream lists (codec negotiation).
+fn sdp_payloads(body: &[u8]) -> Vec<u8> {
+    let sdp = parse_sdp(body).expect("parseable SDP");
+    let audio = sdp
+        .media
+        .iter()
+        .find(|media| media.media == "audio")
+        .expect("audio stream");
+    audio.payload_types.clone()
+}
+
 // ----- messages the fake phones send ---------------------------------------
 
 fn sdp_body(media: &str) -> Vec<u8> {
@@ -179,6 +190,31 @@ fn sdp_body(media: &str) -> Vec<u8> {
          a=ptime:10\r\n"
     )
     .into_bytes()
+}
+
+/// SDP offering an explicit payload-type list (codec negotiation tests).
+fn sdp_body_with_payloads(media: &str, payloads: &str) -> Vec<u8> {
+    let (ip, port) = media.split_once(':').expect("ip:port");
+    let mut text = format!(
+        "v=0\r\n\
+         o=phone 1 1 IN IP4 {ip}\r\n\
+         s=-\r\n\
+         c=IN IP4 {ip}\r\n\
+         t=0 0\r\n\
+         m=audio {port} RTP/AVP {payloads}\r\n"
+    );
+    for (payload, rtpmap) in [
+        ("0", "a=rtpmap:0 PCMU/8000"),
+        ("8", "a=rtpmap:8 PCMA/8000"),
+        ("101", "a=rtpmap:101 telephone-event/8000"),
+    ] {
+        if payloads.split(' ').any(|offered| offered == payload) {
+            text.push_str(rtpmap);
+            text.push_str("\r\n");
+        }
+    }
+    text.push_str("a=ptime:10\r\n");
+    text.into_bytes()
 }
 
 fn register_bytes(number: &str, contact: &str, authorization: Option<&str>) -> Vec<u8> {
@@ -225,8 +261,12 @@ fn nonce_of(response: &Response) -> String {
 }
 
 fn invite_bytes(from: &str, to: &str, call_id: &str, media: &str) -> Vec<u8> {
-    let body = sdp_body(media);
-    let mut text = format!(
+    invite_with_body(from, to, call_id, &sdp_body(media))
+}
+
+/// The same INVITE carrying an explicit body (codec negotiation tests).
+fn invite_with_body(from: &str, to: &str, call_id: &str, body: &[u8]) -> Vec<u8> {
+    let text = format!(
         "INVITE sip:{to}@192.0.2.10 SIP/2.0\r\n\
          Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-{call_id}\r\n\
          Max-Forwards: 70\r\n\
@@ -239,8 +279,9 @@ fn invite_bytes(from: &str, to: &str, call_id: &str, media: &str) -> Vec<u8> {
          Content-Length: {}\r\n\r\n",
         body.len()
     );
-    text.push_str(&String::from_utf8(body).unwrap());
-    text.into_bytes()
+    let mut bytes = text.into_bytes();
+    bytes.extend_from_slice(body);
+    bytes
 }
 
 fn bye_bytes(from: &str, to_uri: &str, to_tag: &str, call_id: &str, cseq: u32) -> Vec<u8> {
@@ -2368,4 +2409,108 @@ fn golden_session_timers_are_not_claimed() {
         None,
         "we never claim session timers"
     );
+}
+
+// ----- codec negotiation (reviews and softphones found both of these) --------
+
+/// The offer toward the callee mirrors what the caller offered. Offering our
+/// whole codec set lets the callee pick something the caller never offered —
+/// and the relay does not transcode, so that audio is garbage.
+#[test]
+fn regression_callee_offer_mirrors_the_callers_codecs() {
+    let mut world = World::with_seed(0xC0DEC);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+
+    // Alice speaks A-law only.
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite_with_body(
+            "1001",
+            "1002",
+            "reg-offer-codecs",
+            &sdp_body_with_payloads("192.0.2.1:10000", "8 101"),
+        ),
+    );
+    let callee_invite = request_of(&outputs, Method::Invite);
+    assert_eq!(
+        sdp_payloads(&callee_invite.body),
+        vec![8, 101],
+        "Bob is offered what Alice offered, never PCMU behind her back"
+    );
+}
+
+/// The answer toward the caller is pinned to what the callee accepted: a wider
+/// answer would let the two legs run different codecs on the same bridge.
+#[test]
+fn regression_answer_is_pinned_to_the_callee_codec() {
+    let mut world = World::with_seed(0xC0DED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+
+    // Alice offers both G.711 flavours ...
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite_bytes("1001", "1002", "reg-pin-codec", "192.0.2.1:10000"),
+    );
+    let callee_invite = request_of(&outputs, Method::Invite);
+    assert_eq!(sdp_payloads(&callee_invite.body), vec![0, 8, 101]);
+
+    // ... and Bob answers A-law only.
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(
+            &callee_invite,
+            200,
+            "OK",
+            "bob1",
+            &sdp_body_with_payloads("192.0.2.2:20000", "8"),
+        ),
+    );
+    let answered = response_of(&outputs, 200);
+    assert_eq!(
+        sdp_payloads(&answered.body),
+        vec![8],
+        "Alice is answered with exactly the codec Bob accepted"
+    );
+}
+
+/// A callee that accepts no codec the caller offered leaves nothing to bridge:
+/// the stream is declined toward the caller, never claimed.
+#[test]
+fn regression_no_shared_codec_declines_the_stream() {
+    let mut world = World::with_seed(0xC0DEF);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite_with_body(
+            "1001",
+            "1002",
+            "reg-no-shared",
+            &sdp_body_with_payloads("192.0.2.1:10000", "8"),
+        ),
+    );
+    let callee_invite = request_of(&outputs, Method::Invite);
+
+    // Bob answers PCMU only — the one thing Alice did not offer.
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(
+            &callee_invite,
+            200,
+            "OK",
+            "bob1",
+            &sdp_body_with_payloads("192.0.2.2:20000", "0"),
+        ),
+    );
+    let answered = response_of(&outputs, 200);
+    let (_, port) = sdp_audio_media(&answered.body).expect("our SDP answer");
+    assert_eq!(port, 0, "the stream is declined: {answered:?}");
 }
