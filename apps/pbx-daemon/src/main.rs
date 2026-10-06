@@ -121,23 +121,20 @@ impl Pbx {
     /// registrations now and then.
     async fn tick(&self) {
         let now = self.now_ms();
-        self.switch.lock().expect("lock").sweep(now);
-        self.switch.lock().expect("lock").expire(now);
-        let due: Vec<String> = self
-            .switch
-            .lock()
-            .expect("lock")
-            .timers()
-            .into_iter()
-            .filter(|(_, due_ms)| *due_ms <= now)
-            .map(|(name, _)| name)
-            .collect();
-        if due.is_empty() {
-            return;
-        }
         let mut outputs = Vec::new();
         {
             let mut switch = self.switch.lock().expect("lock");
+            // sweep() hands back the teardown of calls that died on media
+            // silence (BYEs, call log) — it must be dispatched like every
+            // other switch output, not dropped.
+            outputs.extend(switch.sweep(now));
+            switch.expire(now);
+            let due: Vec<String> = switch
+                .timers()
+                .into_iter()
+                .filter(|(_, due_ms)| *due_ms <= now)
+                .map(|(name, _)| name)
+                .collect();
             for name in due {
                 outputs.extend(switch.on_timer(&name, now));
             }

@@ -204,6 +204,7 @@ impl Switch {
     /// Tears down calls whose media went silent: endpoints that die without a
     /// BYE must not hold their relay ports forever (docs/04 "no leaks").
     /// Mirrors the peer-side `rtp_timeout` behavior we saw on MikoPBX.
+    #[must_use = "the outputs are the BYEs and call log of the teardown; dispatch them"]
     pub fn sweep(&mut self, now_ms: u64) -> Vec<Output> {
         let stale: Vec<u64> = self
             .calls
@@ -285,6 +286,7 @@ impl Switch {
     }
 
     /// A timer armed from [`Switch::timers`] fired.
+    #[must_use = "the outputs are SIP messages; dispatch them"]
     pub fn on_timer(&mut self, name: &str, now_ms: u64) -> Vec<Output> {
         let Some((id, slot, timer)) = parse_timer_name(name) else {
             return vec![];
@@ -348,6 +350,7 @@ impl Switch {
     /// Feeds one incoming SIP message; returns what to send and log. `from` is
     /// where the message arrived from (a trunk peer, a phone) — it decides
     /// admission, and nothing else.
+    #[must_use = "the outputs are SIP messages and call log; dispatch them"]
     pub fn handle(
         &mut self,
         message: Message,
@@ -1150,6 +1153,7 @@ impl Switch {
     ///
     /// The transparent pipe (docs/02 §8): the packet's bytes go out unchanged.
     /// Garbage in, nothing out.
+    #[must_use = "the outputs are the relayed packets; dispatch them"]
     pub fn on_rtp(&mut self, local_port: u16, from: &str, data: &[u8], now_ms: u64) -> Vec<Output> {
         let Ok(packet) = rtp::Packet::parse(data) else {
             return vec![];
