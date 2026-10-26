@@ -89,8 +89,9 @@ pub enum ServerState {
     Proceeding,
     /// Final response sent; retransmitting it (INVITE) or waiting out Timer J.
     Completed,
-    /// 2xx sent for an INVITE (RFC 6026): retransmit it on request
-    /// retransmissions until Timer L expires.
+    /// 2xx sent for an INVITE (RFC 6026): retransmit it on a timer until the
+    /// ACK arrives (RFC 3261 §13.3.1.4) and on request retransmissions until
+    /// Timer L expires.
     Accepted,
     /// ACK received (INVITE, non-2xx); waiting out Timer I.
     Confirmed,
@@ -298,6 +299,9 @@ pub struct ServerTransaction {
     retransmit_interval_ms: u64,
     give_up_ms: u64,
     confirmed_ms: Option<u64>,
+    /// Whether our sent 2xx got its ACK (RFC 3261 §13.3.1.4): the 2xx is
+    /// retransmitted until then.
+    acknowledged: bool,
 }
 
 impl ServerTransaction {
@@ -320,6 +324,7 @@ impl ServerTransaction {
                 retransmit_interval_ms: T1_MS,
                 give_up_ms: now_ms + GIVE_UP_MS,
                 confirmed_ms: None,
+                acknowledged: false,
             };
             (
                 transaction,
@@ -338,6 +343,7 @@ impl ServerTransaction {
                 retransmit_interval_ms: T1_MS,
                 give_up_ms: now_ms + GIVE_UP_MS,
                 confirmed_ms: None,
+                acknowledged: false,
             };
             (transaction, vec![Action::DeliverRequest(request)])
         }
@@ -361,9 +367,14 @@ impl ServerTransaction {
                 (self.give_up_ms, Timer::H),
             )),
             ServerState::Completed => Some((self.give_up_ms, Timer::J)),
-            // RFC 6026: a sent 2xx is retransmitted on request
-            // retransmissions until Timer L expires.
-            ServerState::Accepted => Some((self.give_up_ms, Timer::L)),
+            // RFC 3261 §13.3.1.4 + RFC 6026: a sent 2xx is retransmitted on a
+            // timer until its ACK arrives (Timer G), while Timer L keeps the
+            // transaction around for INVITE retransmissions.
+            ServerState::Accepted if self.acknowledged => Some((self.give_up_ms, Timer::L)),
+            ServerState::Accepted => Some(earliest(
+                (self.retransmit_next_ms, Timer::G),
+                (self.give_up_ms, Timer::L),
+            )),
             ServerState::Confirmed => self.confirmed_ms.map(|due| (due, Timer::I)),
             _ => None,
         }
@@ -390,11 +401,15 @@ impl ServerTransaction {
             }
             (true, status) if status < 300 => {
                 // RFC 6026: the server transaction stays in "Accepted" and
-                // retransmits the 2xx on request retransmissions until
+                // retransmits the 2xx — on a timer until its ACK arrives
+                // (RFC 3261 §13.3.1.4), on request retransmissions until
                 // Timer L; the dialog layer owns the ACK.
                 self.state = ServerState::Accepted;
                 self.last_response = Some(response.clone());
+                self.retransmit_interval_ms = T1_MS;
+                self.retransmit_next_ms = now_ms + T1_MS;
                 self.give_up_ms = now_ms + GIVE_UP_MS;
+                self.acknowledged = false;
                 vec![Action::Send(Message::Response(response))]
             }
             (true, _) => {
@@ -422,7 +437,7 @@ impl ServerTransaction {
     /// A request retransmission arrived; retransmit our last response if we
     /// have one (§17.2).
     pub fn on_request(&mut self, request: &Request) -> Vec<Action> {
-        if request.method != self.request.method || !self.matches_request(request) {
+        if !self.matches_request(request) {
             return vec![];
         }
         let retransmit = matches!(
@@ -438,8 +453,13 @@ impl ServerTransaction {
         }
     }
 
-    /// The ACK for our non-2xx final response arrived.
+    /// An ACK for one of our responses arrived.
     pub fn on_ack(&mut self, now_ms: u64) -> Vec<Action> {
+        if self.invite && self.state == ServerState::Accepted {
+            // Our 2xx was acknowledged: stop retransmitting it. Timer L still
+            // absorbs INVITE retransmissions (RFC 6026).
+            self.acknowledged = true;
+        }
         if self.invite && self.state == ServerState::Completed {
             self.state = ServerState::Confirmed;
             self.confirmed_ms = Some(now_ms + T4_MS);
@@ -450,13 +470,11 @@ impl ServerTransaction {
     /// A due timer fired.
     pub fn on_timer(&mut self, timer: Timer, now_ms: u64) -> Vec<Action> {
         match (self.state, timer) {
-            (ServerState::Completed, Timer::G) if self.invite => {
-                self.retransmit_interval_ms = (self.retransmit_interval_ms * 2).min(T2_MS);
-                self.retransmit_next_ms = now_ms + self.retransmit_interval_ms;
-                match &self.last_response {
-                    Some(response) => vec![Action::Send(Message::Response(response.clone()))],
-                    None => vec![],
-                }
+            (ServerState::Completed, Timer::G) if self.invite => self.retransmit_last(now_ms),
+            // Our 2xx is retransmitted the same way until its ACK arrives
+            // (RFC 3261 §13.3.1.4).
+            (ServerState::Accepted, Timer::G) if self.invite && !self.acknowledged => {
+                self.retransmit_last(now_ms)
             }
             (ServerState::Completed, Timer::H) if self.invite => {
                 // No ACK ever came.
@@ -484,15 +502,50 @@ impl ServerTransaction {
         branch(&self.request.headers)
     }
 
-    /// Whether this request is a retransmission of ours (Via branch + method).
+    /// Whether this request is a retransmission of ours (same method, Via
+    /// branch + CSeq; falls back to Call-ID when a branch is missing).
     pub fn matches_request(&self, request: &Request) -> bool {
+        if request.method != self.request.method {
+            return false;
+        }
+        // A retransmission is the *same* request: same CSeq number too.
+        if cseq_number(&self.request.headers) != cseq_number(&request.headers) {
+            return false;
+        }
         match (branch(&self.request.headers), branch(&request.headers)) {
             (Some(a), Some(b)) => a == b,
             _ => {
                 header(&self.request.headers, "call-id") == header(&request.headers, "call-id")
-                    && cseq_number(&self.request.headers) == cseq_number(&request.headers)
-                    && header(&self.request.headers, "call-id").is_some()
+                    && cseq_number(&self.request.headers).is_some()
             }
+        }
+    }
+
+    /// Whether this ACK acknowledges the response we sent: the non-2xx ACK
+    /// shares the INVITE's branch (§17.1.1.3), while the 2xx ACK is its own
+    /// transaction with a fresh branch (§13.2.2.4) and matches by Call-ID +
+    /// CSeq number instead.
+    pub fn matches_ack(&self, request: &Request) -> bool {
+        if request.method != Method::Ack || !self.invite {
+            return false;
+        }
+        match (branch(&self.request.headers), branch(&request.headers)) {
+            (Some(a), Some(b)) if a == b => true,
+            _ => {
+                header(&self.request.headers, "call-id") == header(&request.headers, "call-id")
+                    && cseq_number(&self.request.headers).is_some()
+                    && cseq_number(&self.request.headers) == cseq_number(&request.headers)
+            }
+        }
+    }
+
+    /// Retransmits our last response with Timer G's doubling schedule.
+    fn retransmit_last(&mut self, now_ms: u64) -> Vec<Action> {
+        self.retransmit_interval_ms = (self.retransmit_interval_ms * 2).min(T2_MS);
+        self.retransmit_next_ms = now_ms + self.retransmit_interval_ms;
+        match &self.last_response {
+            Some(response) => vec![Action::Send(Message::Response(response.clone()))],
+            None => vec![],
         }
     }
 }

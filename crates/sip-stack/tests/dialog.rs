@@ -1,6 +1,6 @@
 //! Header value helpers: URIs, tags, display names.
 
-use sip_stack::{tag_of, uri_of, with_tag};
+use sip_stack::{tag_of, uri_of, with_tag, Dialog};
 
 #[test]
 fn uri_of_skips_display_names() {
@@ -34,4 +34,27 @@ fn tags_round_trip() {
     assert_eq!(tag_of("<sip:a@b>"), None);
     assert_eq!(with_tag("<sip:a@b>", "x"), "<sip:a@b>;tag=x");
     assert_eq!(with_tag("<sip:a@b>;tag=y", "x"), "<sip:a@b>;tag=y");
+}
+
+#[test]
+fn remote_cseq_only_goes_up() {
+    // RFC 3261 §12.2.2: an out-of-order request is stale — it must not move
+    // dialog state (media, targets) back to where an older request left it.
+    let mut dialog = Dialog::new(
+        "call-1",
+        "sip:pbx@192.0.2.10",
+        "ours",
+        "sip:bob@192.0.2.2",
+        "theirs",
+        "sip:bob@192.0.2.2:5060",
+    );
+    assert_eq!(
+        dialog.remote_cseq, None,
+        "the remote side has not spoken yet"
+    );
+    assert!(dialog.accept_remote_cseq(2));
+    assert!(dialog.accept_remote_cseq(3));
+    assert!(!dialog.accept_remote_cseq(3), "a repeat is stale");
+    assert!(!dialog.accept_remote_cseq(2), "an older request is stale");
+    assert_eq!(dialog.remote_cseq, Some(3), "and leaves no trace");
 }

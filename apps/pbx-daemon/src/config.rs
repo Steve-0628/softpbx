@@ -87,11 +87,8 @@ pub struct General {
     pub pbx_host: String,
     /// Our IP as devices see it, for SDP media ("192.0.2.10").
     pub rtp_host: String,
-    /// First media relay port (two per concurrent call).
     pub rtp_port_base: u16,
-    /// How many media ports to bind (two per concurrent call).
     pub rtp_ports: u16,
-    /// Where the call log goes (NDJSON, append only).
     pub call_log: String,
 }
 
@@ -99,11 +96,8 @@ pub struct General {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeviceCfg {
-    /// Its number ("1001").
     pub number: String,
-    /// Display name.
     pub name: String,
-    /// Password the device registers with.
     pub secret: String,
 }
 

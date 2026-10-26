@@ -2478,10 +2478,12 @@ fn regression_answer_is_pinned_to_the_callee_codec() {
     );
 }
 
-/// A callee that accepts no codec the caller offered leaves nothing to bridge:
-/// the stream is declined toward the caller, never claimed.
+/// A callee that commits to a codec the caller never offered leaves nothing to
+/// bridge (the relay does not transcode): the call fails outright — 488 toward
+/// the caller, the callee hung up — instead of "connecting" with unusable
+/// audio. This mirrors the 488 an offer we share no codec with already gets.
 #[test]
-fn regression_no_shared_codec_declines_the_stream() {
+fn regression_no_shared_codec_fails_the_call() {
     let mut world = World::with_seed(0xC0DEF);
     let mut switch = switch();
     register_both(&mut world, &mut switch);
@@ -2510,7 +2512,259 @@ fn regression_no_shared_codec_declines_the_stream() {
             &sdp_body_with_payloads("192.0.2.2:20000", "0"),
         ),
     );
+    assert_eq!(
+        requests_of(&outputs, Method::Ack).len(),
+        1,
+        "the 200 is still ACKed: {outputs:?}"
+    );
+    assert_eq!(
+        requests_of(&outputs, Method::Bye).len(),
+        1,
+        "and the callee is hung up: {outputs:?}"
+    );
+    assert_eq!(
+        response_of(&outputs, 488).status,
+        488,
+        "the caller is told why: {outputs:?}"
+    );
+    assert_eq!(switch.active_calls(), 0, "no dead call is left behind");
+    let logs = call_logs(&outputs);
+    assert!(logs[0].contains("\"result\":\"no-codec\""), "{}", logs[0]);
+}
+
+// ----- dialog, media and transaction regressions ----------------------------
+
+/// A lost 200 must not strand a ringing caller: once the 180 silenced its
+/// INVITE, only our retransmissions get the answer through (RFC 3261
+/// §13.3.1.4).
+#[test]
+fn regression_lost_200_is_retransmitted_until_the_ack() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite_bytes("1001", "1002", "reg-lost-200", "192.0.2.1:10000"),
+    );
+    let callee_invite = request_of(&outputs, Method::Invite);
+    let _ = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(&callee_invite, 180, "Ringing", "bob1", b""),
+    );
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &response_bytes(
+            &callee_invite,
+            200,
+            "OK",
+            "bob1",
+            &sdp_body("192.0.2.2:20000"),
+        ),
+    );
     let answered = response_of(&outputs, 200);
-    let (_, port) = sdp_audio_media(&answered.body).expect("our SDP answer");
-    assert_eq!(port, 0, "the stream is declined: {answered:?}");
+    let to_tag = tag_of(header_value(&answered.headers, "to").unwrap())
+        .expect("our To tag")
+        .to_string();
+
+    // The 200 is lost. The caller heard 180 and is silent — the answer must
+    // still find it.
+    let (name, due) = switch.timers()[0].clone();
+    world.arm(name, due);
+    let Event::Timer { name } = world.next_event().expect("a retransmission timer") else {
+        panic!("expected a timer");
+    };
+    let outputs = switch.on_timer(&name, world.now_ms());
+    assert_eq!(
+        response_of(&outputs, 200).status,
+        200,
+        "the answer goes out again: {outputs:?}"
+    );
+
+    // The ACK lands: the retransmissions stop.
+    let _ = feed(
+        &mut world,
+        &mut switch,
+        &ack_bytes("reg-lost-200", "1001", "1002", &to_tag),
+    );
+    let mut after_ack = 0;
+    loop {
+        let timers = switch.timers();
+        if timers.is_empty() {
+            break;
+        }
+        for (name, due) in timers {
+            world.arm(name, due);
+        }
+        while let Some(event) = world.next_event() {
+            if let Event::Timer { name } = event {
+                let outputs = switch.on_timer(&name, world.now_ms());
+                after_ack += usize::from(response_of_maybe(&outputs, 200).is_some());
+            }
+        }
+    }
+    assert_eq!(after_ack, 0, "no retransmission after the ACK");
+}
+
+/// A stale re-INVITE must not drag media back to an older endpoint (RFC 3261
+/// §12.2.2: in-dialog CSeq numbers only go up).
+#[test]
+fn regression_stale_reinvite_is_rejected() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let call = establish_call(
+        &mut world,
+        &mut switch,
+        "reg-stale-reinvite",
+        "1001",
+        "1002",
+        "192.0.2.1:10000",
+        "192.0.2.2:20000",
+    );
+
+    // A re-INVITE moves the caller's media ...
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &reinvite_bytes(
+            &call.call_id,
+            "1001",
+            "from1",
+            &call.to_tag,
+            3,
+            "192.0.2.1:11000",
+        ),
+    );
+    assert_eq!(response_of(&outputs, 200).status, 200);
+
+    // ... then an older one arrives late, pointing somewhere else.
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &reinvite_bytes(
+            &call.call_id,
+            "1001",
+            "from1",
+            &call.to_tag,
+            2,
+            "192.0.2.1:12000",
+        ),
+    );
+    assert_eq!(
+        response_of(&outputs, 500).status,
+        500,
+        "a stale request is out of order: {outputs:?}"
+    );
+
+    // Media still goes where the freshest request said.
+    let packet = Packet::build(false, 0, 1, 160, 9, &[0xff; 80]);
+    let outputs = switch.on_rtp(
+        call.callee_relay_port,
+        &call.callee_media,
+        packet.to_bytes(),
+        0,
+    );
+    let forwards = rtp_forwards(&outputs);
+    assert_eq!(forwards.len(), 1, "the relay still works: {outputs:?}");
+    assert_eq!(
+        forwards[0].0, "192.0.2.1:11000",
+        "the stale request moved nothing"
+    );
+}
+
+/// A held call is silent on purpose: the media timeout must wait for a resume,
+/// and restart from there (docs/04).
+#[test]
+fn regression_held_calls_do_not_time_out() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let call = establish_call(
+        &mut world,
+        &mut switch,
+        "reg-hold-timeout",
+        "1001",
+        "1002",
+        "192.0.2.1:10000",
+        "192.0.2.2:20000",
+    );
+
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &reinvite_bytes(&call.call_id, "1001", "from1", &call.to_tag, 2, "0.0.0.0:0"),
+    );
+    assert_eq!(
+        response_of(&outputs, 200).status,
+        200,
+        "the hold is answered"
+    );
+
+    // Well past the timeout, silence is still just a hold.
+    world.advance(300_000);
+    assert!(
+        switch.sweep(300_000).is_empty(),
+        "held calls do not time out"
+    );
+    assert_eq!(switch.active_calls(), 1);
+
+    // Resume: the inactivity clock starts over.
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &reinvite_bytes(
+            &call.call_id,
+            "1001",
+            "from1",
+            &call.to_tag,
+            3,
+            "192.0.2.1:11000",
+        ),
+    );
+    assert_eq!(response_of(&outputs, 200).status, 200);
+    assert!(
+        switch.sweep(300_000 + 119_000).is_empty(),
+        "no premature teardown after the resume"
+    );
+    let outputs = switch.sweep(300_000 + 120_000);
+    assert_eq!(
+        requests_of(&outputs, Method::Bye).len(),
+        2,
+        "and silence after the resume still ends it: {outputs:?}"
+    );
+}
+
+/// A Contact with a display name must not become a request-URI (docs/09):
+/// `"Bob" <sip:bob@host>` carries an address, not a URI.
+#[test]
+fn regression_display_name_contact_still_routes() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_device(
+        &mut world,
+        &mut switch,
+        "1001",
+        "change-me",
+        "<sip:alice@192.0.2.1:5060>",
+    );
+    register_device(
+        &mut world,
+        &mut switch,
+        "1002",
+        "bob-secret",
+        "\"Bob\" <sip:bob@192.0.2.2:5060>",
+    );
+    let outputs = feed(
+        &mut world,
+        &mut switch,
+        &invite_bytes("1001", "1002", "reg-contact-name", "192.0.2.1:10000"),
+    );
+    let callee_invite = request_of(&outputs, Method::Invite);
+    assert_eq!(
+        callee_invite.uri, "sip:bob@192.0.2.2:5060",
+        "the request line carries the URI, display name stripped"
+    );
 }

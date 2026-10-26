@@ -293,12 +293,42 @@ fn invite_server_2xx_stays_accepted_until_l() {
     let actions = tx.on_response_from_user(response(200, "INVITE", "z9hG4bK3"), 100);
     assert!(matches!(&actions[..], [Action::Send(_)]));
     assert_eq!(tx.state(), ServerState::Accepted);
+    // The ACK stops the 2xx retransmissions; Timer L remains.
+    let _ = tx.on_ack(200);
     assert_eq!(tx.next_timer(), Some((100 + GIVE_UP_MS, Timer::L)));
 
     // Retransmitted INVITE: repeat the 2xx.
     let actions = tx.on_request(&request(Method::Invite, "z9hG4bK3"));
     assert!(matches!(&actions[..], [Action::Send(Message::Response(r))] if r.status == 200));
 
+    assert_eq!(tx.on_timer(Timer::L, 100 + GIVE_UP_MS), vec![Action::Done]);
+    assert_eq!(tx.state(), ServerState::Terminated);
+}
+
+#[test]
+fn invite_server_2xx_retransmits_until_the_ack_arrives() {
+    // RFC 3261 §13.3.1.4: a lost 2xx must not strand a ringing caller —
+    // once it stops retransmitting its INVITE, only our retransmissions can
+    // get the answer through.
+    let (mut tx, _) = ServerTransaction::new(request(Method::Invite, "z9hG4bK3"), 0);
+    let _ = tx.on_response_from_user(response(200, "INVITE", "z9hG4bK3"), 100);
+    assert_eq!(tx.state(), ServerState::Accepted);
+    // Retransmit on Timer G (T1 doubling to T2), like a non-2xx final.
+    assert_eq!(tx.next_timer(), Some((100 + T1_MS, Timer::G)));
+    let actions = tx.on_timer(Timer::G, 100 + T1_MS);
+    assert!(matches!(&actions[..], [Action::Send(Message::Response(r))] if r.status == 200));
+    assert_eq!(tx.next_timer(), Some((100 + T1_MS + 2 * T1_MS, Timer::G)));
+
+    // The 2xx ACK is its own transaction (§13.2.2.4): a fresh branch, so it
+    // matches by Call-ID + CSeq. It stops the retransmissions.
+    let ack = request(Method::Ack, "z9hG4bK-ack-own-transaction");
+    assert!(tx.matches_ack(&ack));
+    let _ = tx.on_ack(1_000);
+    assert_eq!(tx.next_timer(), Some((100 + GIVE_UP_MS, Timer::L)));
+
+    // Timer L still absorbs INVITE retransmissions (RFC 6026) until it ends.
+    let actions = tx.on_request(&request(Method::Invite, "z9hG4bK3"));
+    assert!(matches!(&actions[..], [Action::Send(Message::Response(r))] if r.status == 200));
     assert_eq!(tx.on_timer(Timer::L, 100 + GIVE_UP_MS), vec![Action::Done]);
     assert_eq!(tx.state(), ServerState::Terminated);
 }

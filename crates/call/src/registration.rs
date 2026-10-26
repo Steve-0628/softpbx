@@ -46,6 +46,9 @@ pub struct Registrar {
     nonce_counter: u64,
     /// Nonces we handed out; only those verify (replay protection).
     issued_nonces: VecDeque<String>,
+    /// The request each nonce has already authorized: one nonce, one request
+    /// (replay protection). Its retransmissions are the only reuse allowed.
+    used_nonces: VecDeque<(String, Request)>,
 }
 
 /// How many outstanding nonces to remember (plenty for a small office).
@@ -78,6 +81,7 @@ impl Registrar {
             bindings: HashMap::new(),
             nonce_counter: 0,
             issued_nonces: VecDeque::new(),
+            used_nonces: VecDeque::new(),
         }
     }
 
@@ -186,7 +190,7 @@ impl Registrar {
         &self.realm
     }
 
-    fn is_authorized(&self, request: &Request, device: &Device, now_ms: u64) -> bool {
+    fn is_authorized(&mut self, request: &Request, device: &Device, now_ms: u64) -> bool {
         let Some(value) = header(&request.headers, "authorization") else {
             return false;
         };
@@ -202,8 +206,30 @@ impl Registrar {
         {
             return false;
         }
-        credentials.username == device.number
-            && digest::verify(&credentials, &device.secret, request.method.as_str())
+        if credentials.username != device.number
+            || !digest::verify(&credentials, &device.secret, request.method.as_str())
+        {
+            return false;
+        }
+        // A captured Authorization is not a password: it may authorize only
+        // the request it was computed for. Its retransmissions (the identical
+        // message, resent when a response got lost) still pass; anything else
+        // reusing the nonce is a replay and gets challenged again.
+        self.consume_nonce(&credentials.nonce, request)
+    }
+
+    /// Marks `nonce` as used by `request`, reporting whether this use is the
+    /// request that owns the nonce (`true`) or a replay (`false`).
+    fn consume_nonce(&mut self, nonce: &str, request: &Request) -> bool {
+        if let Some((_, owner)) = self.used_nonces.iter().find(|(used, _)| used == nonce) {
+            return owner == request;
+        }
+        if self.used_nonces.len() >= MAX_NONCES {
+            self.used_nonces.pop_front();
+        }
+        self.used_nonces
+            .push_back((nonce.to_string(), request.clone()));
+        true
     }
 
     fn next_nonce(&mut self, now_ms: u64) -> String {
@@ -242,13 +268,17 @@ pub fn number_from_uri(uri: &str) -> Option<String> {
     }
 }
 
+/// The address of a REGISTER's Contact: where calls will be sent. Display
+/// names are no part of it (`"Bob" <sip:bob@host>` → `sip:bob@host`, docs/09) —
+/// this string becomes a request-URI later, so anything that is not one clean
+/// URI is refused here rather than surfacing as a malformed INVITE.
 fn contact_of(request: &Request) -> Option<String> {
     let contact = header(&request.headers, "contact")?.trim();
-    let address = match contact.split_once('>') {
-        Some((open, _)) => open.trim_start_matches('<').trim(),
-        None => contact.split(';').next().unwrap_or("").trim(),
-    };
-    if address.is_empty() || address == "*" {
+    if contact == "*" {
+        return None;
+    }
+    let address = uri_of(contact);
+    if address.is_empty() || address == "*" || address.contains(char::is_whitespace) {
         None
     } else {
         Some(address.to_string())

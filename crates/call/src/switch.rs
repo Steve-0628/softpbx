@@ -223,6 +223,8 @@ impl Switch {
     /// Tears down calls whose media went silent: endpoints that die without a
     /// BYE must not hold their relay ports forever (docs/04 "no leaks").
     /// Mirrors the peer-side `rtp_timeout` behavior we saw on MikoPBX.
+    /// Held calls are exempt: silence is the point of a hold, so the
+    /// inactivity clock restarts when media resumes.
     #[must_use = "the outputs are the BYEs and call log of the teardown; dispatch them"]
     pub fn sweep(&mut self, now_ms: u64) -> Vec<Output> {
         let stale: Vec<u64> = self
@@ -230,7 +232,7 @@ impl Switch {
             .iter()
             .filter(|(_, call)| {
                 call.state == CallState::Answered
-                    && call.media.is_some()
+                    && call.media.as_ref().is_some_and(|media| !media.paused)
                     && now_ms.saturating_sub(call.last_media_ms) >= MEDIA_TIMEOUT_MS
             })
             .map(|(id, _)| *id)
@@ -831,7 +833,7 @@ impl Switch {
         push_sends(&mut outputs, actions);
 
         let caller_to_uri = header(&request.headers, "to").map(uri_of).unwrap_or("");
-        let caller_dialog = Dialog::new(
+        let mut caller_dialog = Dialog::new(
             &caller_call_id,
             caller_to_uri, // §12.2.1.1: our side is the request's To URI
             &our_caller_tag,
@@ -839,6 +841,9 @@ impl Switch {
             &caller_tag,
             &caller_contact,
         );
+        // The INVITE opened the dialog, so its CSeq is the remote sequence
+        // number everything from the caller must beat (RFC 3261 §12.2.2).
+        caller_dialog.remote_cseq = cseq_number_of(&request);
         let mut callee_dialog = Dialog::new(
             &callee_call_id,
             &caller_uri,
@@ -890,6 +895,19 @@ impl Switch {
         let Some((id, leg)) = self.find_leg(&request) else {
             return vec![];
         };
+        // A retransmission gets our last response again (§17.2) — never a
+        // second answer and never a fresh look at its CSeq.
+        if let Some(call) = self.calls.get_mut(&id) {
+            if let Some(tx) = call
+                .server_txs
+                .iter_mut()
+                .find(|tx| tx.matches_request(&request))
+            {
+                let mut outputs = Vec::new();
+                push_sends(&mut outputs, tx.on_request(&request));
+                return outputs;
+            }
+        }
         // Only a live call can be refreshed; a re-INVITE after teardown gets
         // 481 (no dead-session resurrections).
         if self
@@ -899,6 +917,12 @@ impl Switch {
         {
             let response = make_response(&request, 481, "Call/Transaction Does Not Exist");
             return vec![Output::Send(Message::Response(response))];
+        }
+        // RFC 3261 §12.2.2: a request whose CSeq is not higher than the last
+        // one from that side is out of order and gets 500 — it must not drag
+        // media or signaling targets back to where an older request left them.
+        if !self.accept_remote_cseq(&id, leg, &request) {
+            return self.refuse(&request, 500, "Server Internal Error", None, now_ms);
         }
         let mut outputs = Vec::new();
         let (mut tx, actions) = ServerTransaction::new(request.clone(), now_ms);
@@ -943,7 +967,9 @@ impl Switch {
             let declined = declined_media(&request.body);
             if moved.is_some() || declined {
                 if let Some(call) = self.calls.get_mut(&id) {
+                    let mut resumed = false;
                     if let Some(media) = call.media.as_mut() {
+                        resumed = media.paused && !declined;
                         media.paused = declined;
                         let leg = match leg {
                             Leg::Caller => &mut media.caller,
@@ -953,6 +979,11 @@ impl Switch {
                             leg.peer_addr = address;
                             leg.learned = None;
                         }
+                    }
+                    if resumed {
+                        // Media flows again: restart the inactivity clock, or
+                        // a call held longer than the timeout dies on resume.
+                        call.last_media_ms = now_ms;
                     }
                 }
             }
@@ -1080,13 +1111,15 @@ impl Switch {
         let Some(call) = self.calls.get_mut(&id) else {
             return vec![];
         };
-        let ack_branch = sip_stack::branch(&request.headers);
+        // The matching transaction stops retransmitting: a non-2xx ACK shares
+        // its INVITE's branch, a 2xx ACK is its own transaction (§13.2.2.4)
+        // and matches by Call-ID + CSeq instead.
         let mut actions = Vec::new();
-        if call.caller_tx.branch() == ack_branch && ack_branch.is_some() {
+        if call.caller_tx.matches_ack(&request) {
             actions.extend(call.caller_tx.on_ack(now_ms));
         }
         for tx in &mut call.server_txs {
-            if tx.branch() == ack_branch && ack_branch.is_some() {
+            if tx.matches_ack(&request) {
                 actions.extend(tx.on_ack(now_ms));
             }
         }
@@ -1099,6 +1132,23 @@ impl Switch {
             let response = make_response(&request, 481, "Call/Transaction Does Not Exist");
             return vec![Output::Send(Message::Response(response))];
         };
+
+        // A retransmitted BYE gets our last response again (§17.2) — the call
+        // is torn down once, not once per copy on the wire.
+        if let Some(call) = self.calls.get_mut(&id) {
+            if let Some(tx) = call
+                .server_txs
+                .iter_mut()
+                .find(|tx| tx.matches_request(&request))
+            {
+                push_sends(&mut outputs, tx.on_request(&request));
+                return outputs;
+            }
+        }
+        // RFC 3261 §12.2.2: out-of-order requests are stale and get 500.
+        if !self.accept_remote_cseq(&id, leg, &request) {
+            return self.refuse(&request, 500, "Server Internal Error", None, now_ms);
+        }
 
         // Answer the BYE on its own transaction (retransmission-safe).
         let (mut tx, actions) = ServerTransaction::new(request.clone(), now_ms);
@@ -1307,10 +1357,25 @@ impl Switch {
                         // A CANCEL may have crossed this 200: the callee just
                         // answered a call the caller already gave up on.
                         // RFC 3261 §15.1.1 — hang that callee up.
-                        let over = self.calls.get(id).is_some_and(|call| {
+                        let crossed = self.calls.get(id).is_some_and(|call| {
                             matches!(call.state, CallState::Terminating | CallState::Terminated)
                         });
-                        if over {
+                        // The relay does not transcode (docs/02 §8): if the
+                        // callee's answer leaves nothing we could answer the
+                        // caller with, the two legs can never understand each
+                        // other. Hang the callee up and fail the call rather
+                        // than bridge a call that cannot carry audio.
+                        let incompatible = self.calls.get(id).is_some_and(|call| {
+                            let Some(media) = call.media.as_ref() else {
+                                return false;
+                            };
+                            let offered = sdp_payload_types(&call.caller_invite.body);
+                            let answer = media.answerable_payloads(offered);
+                            !answer
+                                .iter()
+                                .any(|pt| media::Codec::of_payload_type(*pt).is_some())
+                        });
+                        if crossed || incompatible {
                             let bye_via = self.via("bye");
                             let bye = self.calls.get_mut(id).and_then(|call| {
                                 call.callee_dialog
@@ -1325,7 +1390,14 @@ impl Switch {
                                 push_sends(&mut outputs, actions);
                             }
                         }
-                        CallEvent::CalleeAnswered
+                        if incompatible && !crossed {
+                            if let Some(call) = self.calls.get_mut(id) {
+                                call.outcome = "no-codec".to_string();
+                            }
+                            CallEvent::CalleeRejected(488)
+                        } else {
+                            CallEvent::CalleeAnswered
+                        }
                     } else {
                         if let Some(call) = self.calls.get_mut(id) {
                             call.outcome = format!("rejected:{}", response.status);
@@ -1625,6 +1697,26 @@ impl Switch {
         }
     }
 
+    /// Applies an in-dialog request's CSeq to the dialog it came in on
+    /// (RFC 3261 §12.2.2): requests from one side must strictly increase,
+    /// or they are stale and must leave dialog state alone.
+    fn accept_remote_cseq(&mut self, id: &u64, leg: Leg, request: &Request) -> bool {
+        let Some(cseq) = cseq_number_of(request) else {
+            return false;
+        };
+        let Some(call) = self.calls.get_mut(id) else {
+            return false;
+        };
+        let dialog = match leg {
+            Leg::Caller => &mut call.caller_dialog,
+            Leg::Callee => match call.callee_dialog.as_mut() {
+                Some(dialog) => dialog,
+                None => return false,
+            },
+        };
+        dialog.accept_remote_cseq(cseq)
+    }
+
     fn build_callee_invite(
         &mut self,
         callee_aor: &str,
@@ -1794,6 +1886,12 @@ fn sdp_payload_types(body: &[u8]) -> Vec<u8> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The CSeq sequence number of a request, if it has one.
+fn cseq_number_of(request: &Request) -> Option<u64> {
+    cseq_parts(header(&request.headers, "cseq").unwrap_or(""))
+        .and_then(|(number, _)| number.parse().ok())
 }
 
 /// The media address ("ip:port") an SDP body offers for audio, if any.

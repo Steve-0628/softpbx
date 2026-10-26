@@ -92,11 +92,7 @@ pub fn audio_sdp_answer(connection_ip: &str, port: u16, offered_payload_types: &
 /// With nothing to mirror (an offer that listed no payload types we know) we
 /// fall back to our own set; the answer side then still enforces the
 /// intersection.
-pub fn audio_sdp_offer(
-    connection_ip: &str,
-    port: u16,
-    near_end_payload_types: &[u8],
-) -> Vec<u8> {
+pub fn audio_sdp_offer(connection_ip: &str, port: u16, near_end_payload_types: &[u8]) -> Vec<u8> {
     let shared = shared_codecs(near_end_payload_types);
     if shared.is_empty() {
         return audio_sdp(connection_ip, port);

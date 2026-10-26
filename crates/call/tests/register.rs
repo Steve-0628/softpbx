@@ -202,6 +202,45 @@ fn display_names_in_to_are_fine() {
 }
 
 #[test]
+fn display_names_in_contact_are_not_part_of_the_address() {
+    // `"Bob" <sip:bob@host>` is what real phones send (docs/09): the binding
+    // is the URI, or every later INVITE starts with a display name.
+    let mut registrar = registrar();
+    let response = register_ok(
+        &mut registrar,
+        "1002",
+        "bob-secret",
+        "\"Bob\" <sip:bob@192.0.2.2:5060>",
+    );
+    assert_eq!(response.status, 200);
+    assert_eq!(
+        registrar.lookup("1002", 0),
+        Some("sip:bob@192.0.2.2:5060"),
+        "the URI, display name stripped"
+    );
+}
+
+#[test]
+fn contacts_that_are_no_uri_are_refused() {
+    // A Contact that is not one address would become a malformed request
+    // line later; registration fails instead.
+    let mut registrar = registrar();
+    let challenge = registrar.handle_register(&register("1001", "Bob the phone", None, None), 0);
+    let nonce = nonce_of(&challenge);
+    let response = registrar.handle_register(
+        &register(
+            "1001",
+            "Bob the phone",
+            None,
+            Some(authorize("1001", "change-me", &nonce, "REGISTER")),
+        ),
+        0,
+    );
+    assert_eq!(response.status, 400);
+    assert!(registrar.lookup("1001", 0).is_none());
+}
+
+#[test]
 fn nonces_we_never_issued_are_refused() {
     // Replay protection: a sniffed response over an unknown nonce is useless.
     let mut registrar = registrar();
@@ -212,6 +251,69 @@ fn nonces_we_never_issued_are_refused() {
     );
     assert_eq!(response.status, 401, "replayed authorization is refused");
     assert!(registrar.lookup("1001", 0).is_none());
+}
+
+#[test]
+fn captured_authorization_cannot_be_replayed() {
+    // A sniffed Authorization is not the password: it registers the one
+    // request it was computed for. Replaying it with another Contact would
+    // move the victim's calls to the attacker's phone (docs/03 §1).
+    let mut registrar = registrar();
+    let challenge = registrar.handle_register(
+        &register("1001", "<sip:alice@192.0.2.1:5060>", None, None),
+        0,
+    );
+    let nonce = nonce_of(&challenge);
+    let stolen = authorize("1001", "change-me", &nonce, "REGISTER");
+    let response = registrar.handle_register(
+        &register(
+            "1001",
+            "<sip:alice@192.0.2.1:5060>",
+            None,
+            Some(stolen.clone()),
+        ),
+        0,
+    );
+    assert_eq!(response.status, 200, "the honest registration works");
+
+    let response = registrar.handle_register(
+        &register("1001", "<sip:mallory@192.0.2.66:5060>", None, Some(stolen)),
+        0,
+    );
+    assert_eq!(response.status, 401, "the replay is challenged, not obeyed");
+    assert_eq!(
+        registrar.lookup("1001", 0),
+        Some("sip:alice@192.0.2.1:5060"),
+        "the binding did not move"
+    );
+}
+
+#[test]
+fn retransmitted_register_is_still_answered() {
+    // A UDP retransmission is the same request resent when a response got
+    // lost — its spent nonce must not turn it into a 401.
+    let mut registrar = registrar();
+    let challenge = registrar.handle_register(
+        &register("1001", "<sip:alice@192.0.2.1:5060>", None, None),
+        0,
+    );
+    let nonce = nonce_of(&challenge);
+    let request = register(
+        "1001",
+        "<sip:alice@192.0.2.1:5060>",
+        None,
+        Some(authorize("1001", "change-me", &nonce, "REGISTER")),
+    );
+    assert_eq!(registrar.handle_register(&request, 0).status, 200);
+    assert_eq!(
+        registrar.handle_register(&request, 0).status,
+        200,
+        "the retransmission gets the same answer"
+    );
+    assert_eq!(
+        registrar.lookup("1001", 0),
+        Some("sip:alice@192.0.2.1:5060")
+    );
 }
 
 #[test]

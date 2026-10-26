@@ -23,6 +23,8 @@ pub struct Dialog {
     pub remote_target: String,
     /// CSeq number for the next request we send.
     pub local_cseq: u64,
+    /// Highest CSeq seen from the remote side (RFC 3261 §12.2.2).
+    pub remote_cseq: Option<u64>,
 }
 
 impl Dialog {
@@ -43,7 +45,20 @@ impl Dialog {
             remote_uri: remote_uri.to_string(),
             remote_target: remote_target.to_string(),
             local_cseq: 0,
+            remote_cseq: None,
         }
+    }
+
+    /// Records the remote CSeq of an incoming in-dialog request and reports
+    /// whether the request is in order (RFC 3261 §12.2.2: requests from the
+    /// remote side must strictly increase). An out-of-order request is stale
+    /// and must be rejected with `500`; it must not touch dialog state.
+    pub fn accept_remote_cseq(&mut self, cseq: u64) -> bool {
+        if self.remote_cseq.is_some_and(|highest| cseq <= highest) {
+            return false;
+        }
+        self.remote_cseq = Some(cseq);
+        true
     }
 
     /// Builds an in-dialog request (BYE, ...), numbering its CSeq.
