@@ -7,7 +7,7 @@
 
 use std::net::SocketAddr;
 
-use call::{Action, Device, Output, Rule, Switch, SwitchConfig, TrunkConfig};
+use call::{Action, Device, Interface, Network, Output, Rule, Switch, SwitchConfig, TrunkConfig};
 use engine_sim::{Event, World};
 use sip_stack::digest::{expected_response, Credentials};
 use sip_stack::{make_response, tag_of};
@@ -25,10 +25,11 @@ fn peer_addr() -> SocketAddr {
 fn switch() -> Switch {
     Switch::new(SwitchConfig {
         realm: REALM.to_string(),
-        pbx_uri: PBX_URI.to_string(),
-        pbx_host: PBX_HOST.to_string(),
-        pbx_contact: "<sip:192.0.2.10:5060>".to_string(),
-        rtp_host: "192.0.2.10".to_string(),
+        interfaces: vec![Interface {
+            network: Network::parse("192.0.2.0/24").expect("network"),
+            sip: PBX_HOST.parse().expect("sip"),
+            rtp: "192.0.2.10".parse().expect("rtp"),
+        }],
         rtp_port_base: 10_000,
         rtp_ports: 100,
         routing: vec![
@@ -779,10 +780,11 @@ fn rtp_packet() -> Vec<u8> {
 fn switch_config_base() -> SwitchConfig {
     SwitchConfig {
         realm: REALM.to_string(),
-        pbx_uri: PBX_URI.to_string(),
-        pbx_host: PBX_HOST.to_string(),
-        pbx_contact: "<sip:192.0.2.10:5060>".to_string(),
-        rtp_host: "192.0.2.10".to_string(),
+        interfaces: vec![Interface {
+            network: Network::parse("192.0.2.0/24").expect("network"),
+            sip: PBX_HOST.parse().expect("sip"),
+            rtp: "192.0.2.10".parse().expect("rtp"),
+        }],
         rtp_port_base: 10_000,
         rtp_ports: 100,
         routing: vec![

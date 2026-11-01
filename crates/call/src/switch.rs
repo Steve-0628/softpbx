@@ -15,7 +15,7 @@
 //! ~32 s after the call ends).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use sip_stack::{
     ack_for_2xx, cseq_parts, make_response, tag_of, uri_of, with_tag, Action, ClientTransaction,
@@ -24,6 +24,7 @@ use sip_stack::{
 use sip_syntax::{canonical_header, parse_sdp, Header, Message, Method, Request, Response};
 
 use crate::call::{transit, CallEvent, CallState, Command};
+use crate::interfaces::{interface_for, Interface};
 use crate::registration::{header, number_from_uri, Device, Registrar};
 use crate::routing::{route, Destination, Rule};
 
@@ -51,14 +52,10 @@ pub struct TrunkConfig {
 pub struct SwitchConfig {
     /// Realm used in digest challenges.
     pub realm: String,
-    /// Our SIP address ("sip:192.0.2.10").
-    pub pbx_uri: String,
-    /// Our host:port, for Via headers ("192.0.2.10:5060").
-    pub pbx_host: String,
-    /// Our Contact ("<sip:192.0.2.10:5060>").
-    pub pbx_contact: String,
-    /// Our IP, advertised in SDP for media relaying.
-    pub rtp_host: String,
+    /// Our local addresses, one per network we serve (docs/02 §4). Each peer
+    /// is served from the interface whose network holds its address: that
+    /// interface's addresses are the ones it sees in Via, Contact and SDP.
+    pub interfaces: Vec<Interface>,
     /// First media relay port.
     pub rtp_port_base: u16,
     /// How many media ports are available (two per concurrent call).
@@ -168,6 +165,10 @@ struct CallCtx {
     callee_dialog: Option<Dialog>,
     /// Which trunk the callee leg is on, if any.
     callee_trunk: Option<String>,
+    /// The caller's address: which local interface serves that side.
+    caller_peer: Option<IpAddr>,
+    /// The callee's address: which local interface serves that side.
+    callee_peer: Option<IpAddr>,
     /// Whether we already retried the INVITE with credentials.
     auth_retried: bool,
     /// Our ACK for the callee's 2xx; re-sent if they retransmit it.
@@ -200,6 +201,10 @@ pub struct Switch {
 impl Switch {
     /// Creates a switch for the given devices and addresses.
     pub fn new(config: SwitchConfig) -> Self {
+        assert!(
+            !config.interfaces.is_empty(),
+            "a switch needs at least one local interface"
+        );
         let registrar = Registrar::new(&config.realm, config.devices.clone());
         let free_rtp_ports =
             (config.rtp_port_base..config.rtp_port_base.saturating_add(config.rtp_ports)).collect();
@@ -370,7 +375,7 @@ impl Switch {
 
     /// Feeds one incoming SIP message; returns what to send and log. `from` is
     /// where the message arrived from (a trunk peer, a phone) — it decides
-    /// admission, and nothing else.
+    /// admission, and which local address serves that side of a new call.
     #[must_use = "the outputs are SIP messages and call log; dispatch them"]
     pub fn handle(
         &mut self,
@@ -393,6 +398,14 @@ impl Switch {
             .trunks
             .iter()
             .any(|trunk| trunk.peer.ip() == address.ip())
+    }
+
+    /// The local interface that serves a peer's address (docs/02 §4): the
+    /// most specific configured network containing it — the first interface
+    /// when the address is unknown or in no network at all.
+    fn local(&self, peer: Option<IpAddr>) -> &Interface {
+        peer.and_then(|address| interface_for(&self.config.interfaces, address))
+            .unwrap_or(&self.config.interfaces[0])
     }
 
     /// Runs the final transition on every call that reached `Terminating`.
@@ -571,20 +584,15 @@ impl Switch {
         // impersonation (docs/02 §6). The far side's own labels (its trunk
         // login in its own domain) are fine.
         if from_trunk {
-            let from_host = header(&request.headers, "from")
-                .map(uri_of)
-                .and_then(|uri| uri.rsplit('@').next())
-                .map(|host| host.split(':').next().unwrap_or(host))
-                .unwrap_or("");
-            let our_host = self
-                .config
-                .pbx_uri
-                .strip_prefix("sip:")
-                .unwrap_or(&self.config.pbx_uri)
-                .split(':')
-                .next()
-                .unwrap_or("");
-            if from_host == our_host
+            // "Our own domain" is any address we serve peers from.
+            let claims_our_address = host_ip(header(&request.headers, "from").unwrap_or(""))
+                .is_some_and(|address| {
+                    self.config
+                        .interfaces
+                        .iter()
+                        .any(|interface| interface.sip.ip() == address)
+                });
+            if claims_our_address
                 && self
                     .config
                     .devices
@@ -620,12 +628,6 @@ impl Switch {
 
         // Call routing (docs/03 §4): where does this number go — a device
         // here, or a number down a trunk to another PBX?
-        let our_domain = self
-            .config
-            .pbx_uri
-            .strip_prefix("sip:")
-            .unwrap_or(&self.config.pbx_uri)
-            .to_string();
         let mut callee_trunk: Option<String> = None;
         let (callee_number, callee_contact, callee_domain) =
             match route(&self.config.routing, &dialed) {
@@ -662,7 +664,10 @@ impl Switch {
                         )));
                         return outputs;
                     };
-                    (number, contact, our_domain)
+                    // The callee is served from the interface that holds its
+                    // address; that interface is its domain.
+                    let domain = self.local(host_ip(&contact)).sip.ip().to_string();
+                    (number, contact, domain)
                 }
                 Destination::Trunk(name, number) => {
                     // Down the trunk: the peer routes the number itself, and
@@ -783,11 +788,15 @@ impl Switch {
         };
         // Both legs must end up on one codec (the relay does not transcode),
         // so the offer toward the callee is what the caller offered, narrowed
-        // to what we support — never our full set.
+        // to what we support — never our full set. The media address in it is
+        // the one the callee's network reaches us on.
+        let callee_peer = host_ip(&callee_contact);
         let callee_body = match &media {
-            Some(media) => {
-                media::audio_sdp_offer(&self.config.rtp_host, media.callee.our_port, &offered)
-            }
+            Some(media) => media::audio_sdp_offer(
+                &self.local(callee_peer).rtp.to_string(),
+                media.callee.our_port,
+                &offered,
+            ),
             None => Vec::new(),
         };
 
@@ -808,6 +817,13 @@ impl Switch {
             .unwrap_or("")
             .to_string();
 
+        // Each side is served from the interface that holds its address
+        // (docs/02 §4): the source of their messages wins, their Contact
+        // stands in when we were not told.
+        let caller_peer = from
+            .map(|address| address.ip())
+            .or_else(|| host_ip(&caller_contact));
+
         // The callee's address of record is the *routed* number, not whatever
         // was dialed (docs/03 §4).
         let callee_aor = format!("sip:{callee_number}@{callee_domain}");
@@ -820,6 +836,7 @@ impl Switch {
             &caller_display,
             &callee_contact,
             callee_body,
+            self.local(callee_peer).sip,
         );
         let callee_call_id = header(&callee_invite.headers, "call-id")
             .unwrap_or("")
@@ -876,6 +893,8 @@ impl Switch {
                 callee_invite: Some(callee_invite),
                 callee_dialog: Some(callee_dialog),
                 callee_trunk,
+                caller_peer,
+                callee_peer,
                 auth_retried: false,
                 callee_ack: None,
                 last_media_ms: now_ms,
@@ -928,7 +947,7 @@ impl Switch {
         let (mut tx, actions) = ServerTransaction::new(request.clone(), now_ms);
         push_sends(&mut outputs, actions);
 
-        let (our_tag, our_port) = {
+        let (our_tag, our_port, peer) = {
             let Some(call) = self.calls.get(&id) else {
                 return outputs;
             };
@@ -940,7 +959,11 @@ impl Switch {
                 Leg::Caller => media.caller.our_port,
                 Leg::Callee => media.callee.our_port,
             });
-            (dialog.local_tag.clone(), port)
+            let peer = match leg {
+                Leg::Caller => call.caller_peer,
+                Leg::Callee => call.callee_peer,
+            };
+            (dialog.local_tag.clone(), port, peer)
         };
 
         // A re-INVITE may also move their signaling target (Contact).
@@ -991,13 +1014,14 @@ impl Switch {
 
         let mut response = tagged(make_response(&request, 200, "OK"), &our_tag);
         if !request.body.is_empty() {
+            let rtp_host = self.local(peer).rtp.to_string();
             if declined_media(&request.body) {
                 // A declined stream gets a declined answer (RFC 3264 §6).
                 response.headers.push(Header {
                     name: "Content-Type".to_string(),
                     value: "application/sdp".to_string(),
                 });
-                response.body = media::declined_sdp(&self.config.rtp_host);
+                response.body = media::declined_sdp(&rtp_host);
             } else if let Some(port) = our_port {
                 let offered = sdp_payload_types(&request.body);
                 // The same rule as the answer at setup: never widen past what
@@ -1010,7 +1034,7 @@ impl Switch {
                     name: "Content-Type".to_string(),
                     value: "application/sdp".to_string(),
                 });
-                response.body = media::audio_sdp_answer(&self.config.rtp_host, port, &answer);
+                response.body = media::audio_sdp_answer(&rtp_host, port, &answer);
             }
         }
         let actions = tx.on_response_from_user(response, now_ms);
@@ -1342,11 +1366,17 @@ impl Switch {
                         CallEvent::CalleeProgress(response.status)
                     } else if response.status < 300 {
                         // ACK for the 2xx (new transaction, §13.2.2.4).
-                        let ack_via = self.via("ack");
-                        let contact = self.config.pbx_contact.clone();
-                        let ack = self.calls.get(id).and_then(|call| {
-                            let invite = call.callee_invite.as_ref()?;
-                            Some(ack_for_2xx(invite, &response, &ack_via, &contact))
+                        let callee_host = self
+                            .calls
+                            .get(id)
+                            .map(|call| self.local(call.callee_peer).sip);
+                        let ack = callee_host.and_then(|host| {
+                            let ack_via = self.via("ack", host);
+                            let contact = contact_for(host);
+                            self.calls.get(id).and_then(|call| {
+                                let invite = call.callee_invite.as_ref()?;
+                                Some(ack_for_2xx(invite, &response, &ack_via, &contact))
+                            })
                         });
                         if let Some(ack) = ack {
                             if let Some(call) = self.calls.get_mut(id) {
@@ -1376,11 +1406,14 @@ impl Switch {
                                 .any(|pt| media::Codec::of_payload_type(*pt).is_some())
                         });
                         if crossed || incompatible {
-                            let bye_via = self.via("bye");
-                            let bye = self.calls.get_mut(id).and_then(|call| {
-                                call.callee_dialog
-                                    .as_mut()
-                                    .map(|dialog| dialog.request(Method::Bye, &bye_via, &contact))
+                            let bye = callee_host.and_then(|host| {
+                                let bye_via = self.via("bye", host);
+                                let contact = contact_for(host);
+                                self.calls.get_mut(id).and_then(|call| {
+                                    call.callee_dialog.as_mut().map(|dialog| {
+                                        dialog.request(Method::Bye, &bye_via, &contact)
+                                    })
+                                })
                             });
                             if let Some(bye) = bye {
                                 let (tx, actions) = ClientTransaction::new(bye, now_ms);
@@ -1441,6 +1474,7 @@ impl Switch {
         }
         let trunk_name = call.callee_trunk.clone()?;
         let invite = call.callee_invite.clone()?;
+        let callee_peer = call.callee_peer;
         let (username, secret) = {
             let trunk = self.config.trunks.iter().find(|t| t.name == trunk_name)?;
             (trunk.username.clone()?, trunk.secret.clone()?)
@@ -1459,6 +1493,7 @@ impl Switch {
         };
         let mut retry = invite;
         // A retry is a new transaction: fresh Via branch, next CSeq.
+        let callee_host = self.local(callee_peer).sip;
         let cseq = header(&retry.headers, "cseq")
             .and_then(|cseq| cseq.split_whitespace().next())
             .and_then(|n| n.parse::<u64>().ok())
@@ -1466,7 +1501,7 @@ impl Switch {
             + 1;
         for entry in &mut retry.headers {
             match canonical_header(&entry.name).as_str() {
-                "via" => entry.value = self.via("invite"),
+                "via" => entry.value = self.via("invite", callee_host),
                 "cseq" => entry.value = format!("{cseq} INVITE"),
                 _ => {}
             }
@@ -1526,9 +1561,19 @@ impl Switch {
 
     /// Turns one semantic command into the SIP actions that carry it out.
     fn command_actions(&mut self, id: &u64, command: Command, now_ms: u64) -> Vec<Action> {
-        let contact = self.config.pbx_contact.clone();
-        let rtp_host = self.config.rtp_host.clone();
-        let via = self.via("bye");
+        // The side this command talks to is served from its own local address
+        // (docs/02 §4): the caller sees the caller-side one, the callee the
+        // callee-side one.
+        let Some(call) = self.calls.get(id) else {
+            return vec![];
+        };
+        let local = self.local(match command {
+            Command::ByeCallee => call.callee_peer,
+            _ => call.caller_peer,
+        });
+        let (host, rtp_host) = (local.sip, local.rtp.to_string());
+        let contact = contact_for(host);
+        let via = self.via("bye", host);
         let Some(call) = self.calls.get_mut(id) else {
             return vec![];
         };
@@ -1724,6 +1769,7 @@ impl Switch {
         caller_display: &str,
         callee_contact: &str,
         body: Vec<u8>,
+        local: SocketAddr,
     ) -> Request {
         let from_tag = self.fresh_tag();
         // Caller identity is carried over, display name included.
@@ -1738,7 +1784,7 @@ impl Switch {
             headers: vec![
                 Header {
                     name: "Via".to_string(),
-                    value: self.via("invite"),
+                    value: self.via("invite", local),
                 },
                 Header {
                     name: "Max-Forwards".to_string(),
@@ -1754,7 +1800,7 @@ impl Switch {
                 },
                 Header {
                     name: "Call-ID".to_string(),
-                    value: self.fresh_call_id(),
+                    value: self.fresh_call_id(local),
                 },
                 Header {
                     name: "CSeq".to_string(),
@@ -1762,7 +1808,7 @@ impl Switch {
                 },
                 Header {
                     name: "Contact".to_string(),
-                    value: self.config.pbx_contact.clone(),
+                    value: contact_for(local),
                 },
                 Header {
                     name: "Content-Type".to_string(),
@@ -1778,24 +1824,41 @@ impl Switch {
         format!("pbx{:06}", self.next_tag)
     }
 
-    fn fresh_call_id(&mut self) -> String {
-        format!(
-            "pbx-call-{:06}@{}",
-            self.next_call + 1,
-            self.config.pbx_host
-        )
+    fn fresh_call_id(&mut self, local: SocketAddr) -> String {
+        format!("pbx-call-{:06}@{}", self.next_call + 1, local)
     }
 
-    fn via(&mut self, what: &str) -> String {
+    fn via(&mut self, what: &str, local: SocketAddr) -> String {
         self.next_branch += 1;
         format!(
             "SIP/2.0/UDP {};branch=z9hG4bK-{}-{:08}",
-            self.config.pbx_host, what, self.next_branch
+            local, what, self.next_branch
         )
     }
 }
 
 // ----- free functions -------------------------------------------------------
+
+/// Our Contact on a local interface ("<sip:192.0.2.10:5060>").
+fn contact_for(local: SocketAddr) -> String {
+    format!("<sip:{local}>")
+}
+
+/// The IP address a SIP URI or header value points at
+/// (`"Alice" <sip:1001@192.0.2.1:5060;transport=udp>` → `192.0.2.1`).
+/// Hostnames resolve to nothing: peers are IP literals (docs/07).
+fn host_ip(value: &str) -> Option<IpAddr> {
+    let address = uri_of(value);
+    let address = address
+        .strip_prefix("sips:")
+        .or_else(|| address.strip_prefix("sip:"))
+        .unwrap_or(address);
+    let hostport = address.rsplit('@').next().unwrap_or(address).trim();
+    if let Ok(socket) = hostport.parse::<SocketAddr>() {
+        return Some(socket.ip());
+    }
+    hostport.parse::<IpAddr>().ok()
+}
 
 fn timer_name(id: u64, slot: TxSlot, timer: Timer) -> String {
     let slot = match slot {

@@ -5,11 +5,13 @@
 //! never performs I/O.
 
 mod call;
+mod interfaces;
 mod registration;
 mod routing;
 mod switch;
 
 pub use call::{transit, CallEvent, CallState, Command};
+pub use interfaces::{interface_for, Interface, Network};
 pub use registration::{
     number_from_request, number_from_uri, Binding, Device, Registrar, DEFAULT_EXPIRES_S,
     MAX_EXPIRES_S, MIN_EXPIRES_S,

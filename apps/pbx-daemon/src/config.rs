@@ -15,6 +15,10 @@ use serde::Deserialize;
 pub struct FileConfig {
     /// Global settings.
     pub general: General,
+    /// The networks we serve, and our addresses on them (docs/02 §4).
+    /// Optional here only so the validator can say why it matters.
+    #[serde(default)]
+    pub interface: Vec<InterfaceCfg>,
     /// Call routing rules, in order (docs/03 §4). Optional: without any, a
     /// dialed number simply rings the device with that number.
     #[serde(default)]
@@ -81,15 +85,23 @@ impl RoutingRule {
 pub struct General {
     /// Realm used in digest authentication.
     pub realm: String,
-    /// Where to listen for SIP ("0.0.0.0:5060").
-    pub sip_bind: String,
-    /// Our address as devices see it, for Via/Contact ("192.0.2.10:5060").
-    pub pbx_host: String,
-    /// Our IP as devices see it, for SDP media ("192.0.2.10").
-    pub rtp_host: String,
     pub rtp_port_base: u16,
     pub rtp_ports: u16,
     pub call_log: String,
+}
+
+/// One `[[interface]]`: a network we serve (docs/02 §4). A peer is served
+/// from the interface whose `network` holds its address — and sees that
+/// interface's addresses in Via, Contact and SDP.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InterfaceCfg {
+    /// The peers served here ("192.168.1.0/24", or one address).
+    pub network: String,
+    /// Our SIP address here: we listen on it and advertise it.
+    pub sip: String,
+    /// Our media address here (advertised in SDP).
+    pub rtp: String,
 }
 
 /// One `[[device]]`.
@@ -123,18 +135,47 @@ impl FileConfig {
         if self.general.realm.is_empty() {
             bail!("general.realm must not be empty");
         }
-        self.general
-            .sip_bind
-            .parse::<SocketAddr>()
-            .with_context(|| "general.sip_bind must be ip:port, e.g. \"0.0.0.0:5060\"")?;
-        self.general
-            .pbx_host
-            .parse::<SocketAddr>()
-            .with_context(|| "general.pbx_host must be ip:port, e.g. \"192.0.2.10:5060\"")?;
-        self.general
-            .rtp_host
-            .parse::<std::net::IpAddr>()
-            .with_context(|| "general.rtp_host must be an ip address, e.g. \"192.0.2.10\"")?;
+        if self.interface.is_empty() {
+            bail!("no [[interface]] sections: nothing could listen or be addressed");
+        }
+        let mut listening = HashSet::new();
+        for interface in &self.interface {
+            call::Network::parse(&interface.network).with_context(|| {
+                format!(
+                    "interface \"{}\": network must be \"ip/prefix\", e.g. \"192.168.1.0/24\"",
+                    interface.network
+                )
+            })?;
+            let sip = interface.sip.parse::<SocketAddr>().with_context(|| {
+                format!(
+                    "interface \"{}\": sip must be ip:port, e.g. \"192.168.1.10:5060\"",
+                    interface.network
+                )
+            })?;
+            if sip.ip().is_unspecified() {
+                bail!(
+                    "interface \"{}\": sip {} is not an address peers can reach",
+                    interface.network,
+                    sip.ip()
+                );
+            }
+            if !listening.insert(sip) {
+                bail!("two interfaces listen on the same address {sip}");
+            }
+            let rtp = interface.rtp.parse::<std::net::IpAddr>().with_context(|| {
+                format!(
+                    "interface \"{}\": rtp must be an ip address",
+                    interface.network
+                )
+            })?;
+            if rtp.is_unspecified() {
+                bail!(
+                    "interface \"{}\": rtp {} is not an address peers can reach",
+                    interface.network,
+                    rtp
+                );
+            }
+        }
         if self.general.rtp_ports < 2 {
             bail!("general.rtp_ports must be at least 2 (two ports per call)");
         }
@@ -231,23 +272,23 @@ impl FileConfig {
         Ok(())
     }
 
+    /// The validated local interfaces, in the switch's shape.
+    pub fn interfaces(&self) -> Vec<call::Interface> {
+        self.interface
+            .iter()
+            .map(|interface| call::Interface {
+                network: call::Network::parse(&interface.network).expect("validated"),
+                sip: interface.sip.parse().expect("validated"),
+                rtp: interface.rtp.parse().expect("validated"),
+            })
+            .collect()
+    }
+
     /// The validated configuration, in the switch's shape.
     pub fn switch_config(&self) -> SwitchConfig {
         SwitchConfig {
             realm: self.general.realm.clone(),
-            // The address-of-record domain is the host, without the SIP port
-            // (RFC 3261 §19.1.5).
-            pbx_uri: format!(
-                "sip:{}",
-                self.general
-                    .pbx_host
-                    .parse::<std::net::SocketAddr>()
-                    .map(|address| address.ip().to_string())
-                    .unwrap_or_else(|_| self.general.pbx_host.clone())
-            ),
-            pbx_host: self.general.pbx_host.clone(),
-            pbx_contact: format!("<sip:{}>", self.general.pbx_host),
-            rtp_host: self.general.rtp_host.clone(),
+            interfaces: self.interfaces(),
             rtp_port_base: self.general.rtp_port_base,
             rtp_ports: self.general.rtp_ports,
             routing: self.routing.iter().map(RoutingRule::to_rule).collect(),
@@ -281,12 +322,14 @@ mod tests {
     const GOOD: &str = r#"
         [general]
         realm = "softpbx"
-        sip_bind = "0.0.0.0:5060"
-        pbx_host = "192.0.2.10:5060"
-        rtp_host = "192.0.2.10"
         rtp_port_base = 10000
         rtp_ports = 100
         call_log = "/tmp/softpbx/calls.ndjson"
+
+        [[interface]]
+        network = "192.0.2.0/24"
+        sip = "192.0.2.10:5060"
+        rtp = "192.0.2.10"
 
         [[device]]
         number = "1001"
@@ -300,7 +343,9 @@ mod tests {
         assert_eq!(config.general.realm, "softpbx");
         assert_eq!(config.device.len(), 1);
         let switch = config.switch_config();
-        assert_eq!(switch.pbx_contact, "<sip:192.0.2.10:5060>");
+        assert_eq!(switch.interfaces.len(), 1);
+        assert_eq!(switch.interfaces[0].sip.to_string(), "192.0.2.10:5060");
+        assert_eq!(switch.interfaces[0].rtp.to_string(), "192.0.2.10");
         assert_eq!(switch.devices[0].number, "1001");
     }
 
@@ -310,12 +355,16 @@ mod tests {
             ("not toml at all", "not valid TOML"),
             ("[general]", "missing field"),
             (
-                &GOOD.replace("sip_bind = \"0.0.0.0:5060\"", "sip_bind = \"everywhere\""),
-                "sip_bind",
+                &GOOD.replace("sip = \"192.0.2.10:5060\"", "sip = \"everywhere\""),
+                "sip",
             ),
             (
-                &GOOD.replace("rtp_host = \"192.0.2.10\"", "rtp_host = \"host\""),
-                "rtp_host",
+                &GOOD.replace("rtp = \"192.0.2.10\"", "rtp = \"host\""),
+                "rtp",
+            ),
+            (
+                &GOOD.replace("network = \"192.0.2.0/24\"", "network = \"192.0.2.0/40\""),
+                "network",
             ),
             (
                 &GOOD.replace("rtp_ports = 100", "rtp_ports = 1"),
@@ -337,6 +386,37 @@ mod tests {
                 "expected {reason:?} in: {error:#}"
             );
         }
+    }
+
+    #[test]
+    fn interfaces_validate() {
+        // Without an interface nothing could listen or be addressed.
+        let none = r#"
+            [general]
+            realm = "softpbx"
+            rtp_port_base = 10000
+            rtp_ports = 100
+            call_log = "/tmp/softpbx/calls.ndjson"
+
+            [[device]]
+            number = "1001"
+            name = "Alice"
+            secret = "change-me"
+        "#;
+        let error = FileConfig::parse(none).expect_err("no interfaces");
+        assert!(format!("{error:#}").contains("[[interface]]"), "{error:#}");
+
+        // Two interfaces cannot listen on the same address.
+        let doubled = format!(
+            "{GOOD}\n[[interface]]\nnetwork = \"198.51.100.0/24\"\nsip = \"192.0.2.10:5060\"\nrtp = \"198.51.100.1\"\n"
+        );
+        let error = FileConfig::parse(&doubled).expect_err("duplicate");
+        assert!(format!("{error:#}").contains("same address"), "{error:#}");
+
+        // A wildcard address is not one peers can reach us at.
+        let wild = GOOD.replace("sip = \"192.0.2.10:5060\"", "sip = \"0.0.0.0:5060\"");
+        let error = FileConfig::parse(&wild).expect_err("unspecified");
+        assert!(format!("{error:#}").contains("reach"), "{error:#}");
     }
 
     #[test]

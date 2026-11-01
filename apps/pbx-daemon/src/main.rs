@@ -10,12 +10,12 @@ mod config;
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use call::{Output, Switch};
+use call::{interface_for, Interface, Output, Switch};
 use sip_syntax::{parse_message, serialize_message, Message};
 use tokio::net::UdpSocket;
 
@@ -29,9 +29,12 @@ const TIMER_TICK_MS: u64 = 50;
 struct Pbx {
     switch: Mutex<Switch>,
     started: Instant,
-    sip: UdpSocket,
-    /// One socket per media relay port (two per call).
-    rtp: HashMap<u16, Arc<UdpSocket>>,
+    /// The local interfaces (docs/02 §4): which address serves which peers.
+    interfaces: Vec<Interface>,
+    /// One SIP socket per interface, keyed by the interface's address.
+    sip: HashMap<SocketAddr, UdpSocket>,
+    /// Media sockets: one per (interface, relay port) pair.
+    rtp: HashMap<(IpAddr, u16), Arc<UdpSocket>>,
     /// Where responses go: Via branch → where its request came from.
     response_route: Mutex<ResponseRoutes>,
     call_log: Mutex<std::fs::File>,
@@ -79,11 +82,21 @@ impl Pbx {
         self.started.elapsed().as_millis() as u64
     }
 
-    /// One SIP datagram arrived: parse, feed the switch, send what it says.
-    async fn handle_sip(&self, data: &[u8], source: SocketAddr) {
+    /// The local interface that serves a peer's address (docs/02 §4): the
+    /// most specific network containing it — the first interface when the
+    /// address is unknown or in no network at all.
+    fn local(&self, peer: IpAddr) -> &Interface {
+        interface_for(&self.interfaces, peer).unwrap_or(&self.interfaces[0])
+    }
+
+    /// One SIP datagram arrived at the interface `local`: parse, feed the
+    /// switch, send what it says.
+    async fn handle_sip(&self, local: SocketAddr, data: &[u8], source: SocketAddr) {
         // Keepalive pings (RFC 5626) get a bare CRLF back and nothing else.
         if sip_syntax::is_keepalive(data) {
-            let _ = self.sip.send_to(b"\r\n", source).await;
+            if let Some(socket) = self.sip.get(&local) {
+                let _ = socket.send_to(b"\r\n", source).await;
+            }
             return;
         }
         let Ok(message) = parse_message(data) else {
@@ -160,8 +173,17 @@ impl Pbx {
                     };
                     match destination {
                         Some(destination) => {
-                            if let Err(error) = self.sip.send_to(&bytes, destination).await {
-                                log(format!("sip send to {destination} failed: {error}"));
+                            // Sent from the interface that serves the peer,
+                            // so the source address matches the one the
+                            // message advertises (docs/02 §4).
+                            let local = self.local(destination.ip());
+                            match self.sip.get(&local.sip) {
+                                Some(socket) => {
+                                    if let Err(error) = socket.send_to(&bytes, destination).await {
+                                        log(format!("sip send to {destination} failed: {error}"));
+                                    }
+                                }
+                                None => log(format!("no SIP socket on {}; dropped", local.sip)),
                             }
                         }
                         None => log(format!(
@@ -179,7 +201,8 @@ impl Pbx {
                         log(format!("media destination {to} is not an address; dropped"));
                         continue;
                     };
-                    match self.rtp.get(&from_port) {
+                    let local = self.local(destination.ip());
+                    match self.rtp.get(&(local.rtp, from_port)) {
                         Some(socket) => {
                             if let Err(error) = socket.send_to(&data, destination).await {
                                 log(format!("media send to {destination} failed: {error}"));
@@ -250,24 +273,35 @@ async fn main() -> anyhow::Result<()> {
         .open(&config.general.call_log)
         .with_context(|| format!("cannot open {}", config.general.call_log))?;
 
-    let sip = UdpSocket::bind(&config.general.sip_bind)
-        .await
-        .with_context(|| format!("cannot bind SIP socket {}", config.general.sip_bind))?;
+    // One SIP socket per interface: we listen on, and send from, the address
+    // each peer is served from (docs/02 §4).
+    let interfaces = config.interfaces();
+    let mut sip = HashMap::new();
+    for interface in &interfaces {
+        let socket = UdpSocket::bind(interface.sip)
+            .await
+            .with_context(|| format!("cannot bind SIP socket {}", interface.sip))?;
+        sip.insert(interface.sip, socket);
+    }
+    // Media sockets: one per (interface, relay port) pair.
     let mut rtp = HashMap::new();
     let first_port = u32::from(config.general.rtp_port_base);
     let last_port = first_port + u32::from(config.general.rtp_ports);
-    for port in first_port..last_port {
-        let port = port as u16;
-        let socket = UdpSocket::bind(("0.0.0.0", port))
-            .await
-            .with_context(|| format!("cannot bind media port {port}"))?;
-        rtp.insert(port, Arc::new(socket));
+    for interface in &interfaces {
+        for port in first_port..last_port {
+            let port = port as u16;
+            let socket = UdpSocket::bind((interface.rtp, port))
+                .await
+                .with_context(|| format!("cannot bind media port {port} on {}", interface.rtp))?;
+            rtp.insert((interface.rtp, port), Arc::new(socket));
+        }
     }
 
     let device_count = config.device.len();
     let pbx = Arc::new(Pbx {
         switch: Mutex::new(Switch::new(config.switch_config())),
         started: Instant::now(),
+        interfaces,
         sip,
         rtp,
         response_route: Mutex::new(ResponseRoutes::new()),
@@ -276,31 +310,35 @@ async fn main() -> anyhow::Result<()> {
 
     log(format!(
         "started: sip={} media={}-{} devices={}",
-        config.general.sip_bind,
+        pbx.interfaces
+            .iter()
+            .map(|interface| interface.sip.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
         config.general.rtp_port_base,
         config.general.rtp_port_base + config.general.rtp_ports - 1,
         device_count
     ));
 
-    // SIP in and out.
-    {
+    // SIP in and out, one task per interface.
+    for local in pbx.sip.keys().copied().collect::<Vec<_>>() {
         let pbx = Arc::clone(&pbx);
         tokio::spawn(async move {
             let mut buffer = vec![0u8; SIP_BUFFER];
             loop {
-                match pbx.sip.recv_from(&mut buffer).await {
-                    Ok((size, source)) => pbx.handle_sip(&buffer[..size], source).await,
+                match pbx.sip[&local].recv_from(&mut buffer).await {
+                    Ok((size, source)) => pbx.handle_sip(local, &buffer[..size], source).await,
                     Err(error) => log(format!("sip receive failed: {error}")),
                 }
             }
         });
     }
 
-    // Media in and out, one task per relay port.
-    for (port, socket) in &pbx.rtp {
+    // Media in and out, one task per relay socket.
+    for (key, socket) in &pbx.rtp {
         let pbx = Arc::clone(&pbx);
         let socket = Arc::clone(socket);
-        let port = *port;
+        let port = key.1;
         tokio::spawn(async move {
             let mut buffer = vec![0u8; RTP_BUFFER];
             loop {

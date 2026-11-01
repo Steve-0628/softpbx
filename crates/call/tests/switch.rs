@@ -1,6 +1,6 @@
 //! Switch behavior at the edges: refusal, cancellation, unknown calls.
 
-use call::{Device, Output, Switch, SwitchConfig};
+use call::{Device, Interface, Network, Output, Switch, SwitchConfig};
 use sip_stack::digest::{expected_response, Credentials};
 use sip_stack::{make_response, with_tag};
 use sip_syntax::{Header, Message, Method, Request, Response};
@@ -8,10 +8,11 @@ use sip_syntax::{Header, Message, Method, Request, Response};
 fn switch() -> Switch {
     Switch::new(SwitchConfig {
         realm: "softpbx".to_string(),
-        pbx_uri: "sip:192.0.2.10".to_string(),
-        pbx_host: "192.0.2.10:5060".to_string(),
-        pbx_contact: "<sip:192.0.2.10:5060>".to_string(),
-        rtp_host: "192.0.2.10".to_string(),
+        interfaces: vec![Interface {
+            network: Network::parse("192.0.2.0/24").expect("network"),
+            sip: "192.0.2.10:5060".parse().expect("sip"),
+            rtp: "192.0.2.10".parse().expect("rtp"),
+        }],
         rtp_port_base: 10_000,
         rtp_ports: 100,
         routing: vec![],

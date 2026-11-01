@@ -11,7 +11,7 @@
 //! Everything runs on the deterministic world and speaks real SIP: messages
 //! cross the boundary as bytes.
 
-use call::{Action, CallState, Device, Output, Rule, Switch, SwitchConfig};
+use call::{Action, CallState, Device, Interface, Network, Output, Rule, Switch, SwitchConfig};
 use engine_sim::{Event, World};
 use rtp::Packet;
 use sip_stack::digest::{expected_response, Credentials};
@@ -23,7 +23,6 @@ use sip_syntax::{
 const REALM: &str = "softpbx";
 const PBX_URI: &str = "sip:192.0.2.10";
 const PBX_HOST: &str = "192.0.2.10:5060";
-const PBX_CONTACT: &str = "<sip:192.0.2.10:5060>";
 
 fn switch_with(devices: Vec<Device>) -> Switch {
     switch_with_ports(devices, 100)
@@ -36,10 +35,11 @@ fn switch_with_ports(devices: Vec<Device>, rtp_ports: u16) -> Switch {
 fn switch_with_routing(devices: Vec<Device>, rtp_ports: u16, routing: Vec<call::Rule>) -> Switch {
     Switch::new(SwitchConfig {
         realm: REALM.to_string(),
-        pbx_uri: PBX_URI.to_string(),
-        pbx_host: PBX_HOST.to_string(),
-        pbx_contact: PBX_CONTACT.to_string(),
-        rtp_host: "192.0.2.10".to_string(),
+        interfaces: vec![Interface {
+            network: Network::parse("192.0.2.0/24").expect("network"),
+            sip: PBX_HOST.parse().expect("sip"),
+            rtp: "192.0.2.10".parse().expect("rtp"),
+        }],
         rtp_port_base: 10_000,
         rtp_ports,
         routing,

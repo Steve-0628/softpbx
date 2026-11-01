@@ -67,12 +67,23 @@ changes).
 
 [general]
 realm = "softpbx"                 # digest-authentication realm
-sip_bind = "0.0.0.0:5060"         # where we listen for SIP
-pbx_host = "192.0.2.10:5060"      # our address as devices see it (Via/Contact)
-rtp_host = "192.0.2.10"           # our IP as devices see it (SDP media)
 rtp_port_base = 10000             # first media relay port
 rtp_ports = 100                   # ports to bind (two per concurrent call)
 call_log = "/var/log/softpbx/calls.ndjson"
+
+# One [[interface]] per network we serve. The peer's address picks the
+# interface — the most specific network holding it — and that interface's
+# addresses are what the peer sees in Via, Contact and SDP. A peer in no
+# configured network is served from the first interface.
+[[interface]]
+network = "192.0.2.0/24"          # the peers served here
+sip = "192.0.2.10:5060"           # our SIP address here (listen + advertise)
+rtp = "192.0.2.10"                # our media address here (SDP)
+
+#[[interface]]
+#network = "10.8.0.0/24"          # a second network (a VPN, say)
+#sip = "10.8.0.2:5060"
+#rtp = "10.8.0.2"
 
 [[device]]
 number = "1001"
@@ -105,6 +116,12 @@ peer = "192.168.77.108:5060"
 # username = "trunkuser"        # digest credentials, for peers that
 # secret = "trunkpass"          # challenge our INVITEs (both or neither)
 ```
+
+A PBX on several networks gets one `[[interface]]` per network. Each peer is
+served from the interface whose `network` holds its address (the most specific
+match), and sees that interface's addresses in Via, Contact and SDP — so a call
+between a phone on the LAN and one on the VPN works in both directions. We
+listen on, and send from, the very addresses we advertise.
 
 One trap worth knowing: rules are **first-match**, so a broad `reject`
 pattern silently shadows device numbers (`1*` blocks 1001/1002 too). Keep
