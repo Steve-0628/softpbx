@@ -98,9 +98,11 @@ pub struct General {
 pub struct InterfaceCfg {
     /// The peers served here ("192.168.1.0/24", or one address).
     pub network: String,
-    /// Our SIP address here: we listen on it and advertise it.
+    /// The SIP address these peers see in Via/Contact. We listen on its
+    /// *port* on all local addresses — the address itself need not be ours
+    /// (a NAT'd or routed address works as long as traffic reaches us).
     pub sip: String,
-    /// Our media address here (advertised in SDP).
+    /// The media address these peers see in SDP.
     pub rtp: String,
 }
 
@@ -138,7 +140,6 @@ impl FileConfig {
         if self.interface.is_empty() {
             bail!("no [[interface]] sections: nothing could listen or be addressed");
         }
-        let mut listening = HashSet::new();
         for interface in &self.interface {
             call::Network::parse(&interface.network).with_context(|| {
                 format!(
@@ -158,9 +159,6 @@ impl FileConfig {
                     interface.network,
                     sip.ip()
                 );
-            }
-            if !listening.insert(sip) {
-                bail!("two interfaces listen on the same address {sip}");
             }
             let rtp = interface.rtp.parse::<std::net::IpAddr>().with_context(|| {
                 format!(
@@ -406,12 +404,12 @@ mod tests {
         let error = FileConfig::parse(none).expect_err("no interfaces");
         assert!(format!("{error:#}").contains("[[interface]]"), "{error:#}");
 
-        // Two interfaces cannot listen on the same address.
-        let doubled = format!(
-            "{GOOD}\n[[interface]]\nnetwork = \"198.51.100.0/24\"\nsip = \"192.0.2.10:5060\"\nrtp = \"198.51.100.1\"\n"
+        // Two networks may share one advertised address: we advertise per
+        // peer, we do not bind the address itself.
+        let shared = format!(
+            "{GOOD}\n[[interface]]\nnetwork = \"198.51.100.0/24\"\nsip = \"192.0.2.10:5060\"\nrtp = \"192.0.2.10\"\n"
         );
-        let error = FileConfig::parse(&doubled).expect_err("duplicate");
-        assert!(format!("{error:#}").contains("same address"), "{error:#}");
+        FileConfig::parse(&shared).expect("shared address");
 
         // A wildcard address is not one peers can reach us at.
         let wild = GOOD.replace("sip = \"192.0.2.10:5060\"", "sip = \"0.0.0.0:5060\"");

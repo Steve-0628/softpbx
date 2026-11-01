@@ -29,12 +29,14 @@ const TIMER_TICK_MS: u64 = 50;
 struct Pbx {
     switch: Mutex<Switch>,
     started: Instant,
-    /// The local interfaces (docs/02 §4): which address serves which peers.
+    /// The local interfaces (docs/02 §4): which address we advertise to
+    /// which peers.
     interfaces: Vec<Interface>,
-    /// One SIP socket per interface, keyed by the interface's address.
-    sip: HashMap<SocketAddr, UdpSocket>,
-    /// Media sockets: one per (interface, relay port) pair.
-    rtp: HashMap<(IpAddr, u16), Arc<UdpSocket>>,
+    /// SIP sockets, keyed by port. Bound on all local addresses: what peers
+    /// see is the address we advertise, not the one the socket holds.
+    sip: HashMap<u16, UdpSocket>,
+    /// One media socket per relay port, bound on all addresses likewise.
+    rtp: HashMap<u16, Arc<UdpSocket>>,
     /// Where responses go: Via branch → where its request came from.
     response_route: Mutex<ResponseRoutes>,
     call_log: Mutex<std::fs::File>,
@@ -89,12 +91,12 @@ impl Pbx {
         interface_for(&self.interfaces, peer).unwrap_or(&self.interfaces[0])
     }
 
-    /// One SIP datagram arrived at the interface `local`: parse, feed the
-    /// switch, send what it says.
-    async fn handle_sip(&self, local: SocketAddr, data: &[u8], source: SocketAddr) {
+    /// One SIP datagram arrived on the socket for port `local_port`: parse,
+    /// feed the switch, send what it says.
+    async fn handle_sip(&self, local_port: u16, data: &[u8], source: SocketAddr) {
         // Keepalive pings (RFC 5626) get a bare CRLF back and nothing else.
         if sip_syntax::is_keepalive(data) {
-            if let Some(socket) = self.sip.get(&local) {
+            if let Some(socket) = self.sip.get(&local_port) {
                 let _ = socket.send_to(b"\r\n", source).await;
             }
             return;
@@ -173,17 +175,20 @@ impl Pbx {
                     };
                     match destination {
                         Some(destination) => {
-                            // Sent from the interface that serves the peer,
-                            // so the source address matches the one the
-                            // message advertises (docs/02 §4).
+                            // Sent from the port of the interface serving the
+                            // peer — the one the message advertises (docs/02
+                            // §4). The source address itself is whatever the
+                            // route picks; peers follow what the messages say.
                             let local = self.local(destination.ip());
-                            match self.sip.get(&local.sip) {
+                            match self.sip.get(&local.sip.port()) {
                                 Some(socket) => {
                                     if let Err(error) = socket.send_to(&bytes, destination).await {
                                         log(format!("sip send to {destination} failed: {error}"));
                                     }
                                 }
-                                None => log(format!("no SIP socket on {}; dropped", local.sip)),
+                                None => {
+                                    log(format!("no SIP socket on port {}; dropped", local.sip))
+                                }
                             }
                         }
                         None => log(format!(
@@ -201,8 +206,7 @@ impl Pbx {
                         log(format!("media destination {to} is not an address; dropped"));
                         continue;
                     };
-                    let local = self.local(destination.ip());
-                    match self.rtp.get(&(local.rtp, from_port)) {
+                    match self.rtp.get(&from_port) {
                         Some(socket) => {
                             if let Err(error) = socket.send_to(&data, destination).await {
                                 log(format!("media send to {destination} failed: {error}"));
@@ -273,28 +277,32 @@ async fn main() -> anyhow::Result<()> {
         .open(&config.general.call_log)
         .with_context(|| format!("cannot open {}", config.general.call_log))?;
 
-    // One SIP socket per interface: we listen on, and send from, the address
-    // each peer is served from (docs/02 §4).
+    // SIP sockets: one per port our interfaces advertise, bound on all local
+    // addresses. What peers see is the address the messages advertise
+    // (docs/02 §4) — the socket need not hold it (NAT'd or routed
+    // addresses work as long as the traffic reaches us).
     let interfaces = config.interfaces();
     let mut sip = HashMap::new();
-    for interface in &interfaces {
-        let socket = UdpSocket::bind(interface.sip)
+    let sip_ports: std::collections::BTreeSet<u16> = interfaces
+        .iter()
+        .map(|interface| interface.sip.port())
+        .collect();
+    for port in sip_ports {
+        let socket = UdpSocket::bind(("0.0.0.0", port))
             .await
-            .with_context(|| format!("cannot bind SIP socket {}", interface.sip))?;
-        sip.insert(interface.sip, socket);
+            .with_context(|| format!("cannot bind SIP port {port}"))?;
+        sip.insert(port, socket);
     }
-    // Media sockets: one per (interface, relay port) pair.
+    // Media sockets: one per relay port, bound on all addresses likewise.
     let mut rtp = HashMap::new();
     let first_port = u32::from(config.general.rtp_port_base);
     let last_port = first_port + u32::from(config.general.rtp_ports);
-    for interface in &interfaces {
-        for port in first_port..last_port {
-            let port = port as u16;
-            let socket = UdpSocket::bind((interface.rtp, port))
-                .await
-                .with_context(|| format!("cannot bind media port {port} on {}", interface.rtp))?;
-            rtp.insert((interface.rtp, port), Arc::new(socket));
-        }
+    for port in first_port..last_port {
+        let port = port as u16;
+        let socket = UdpSocket::bind(("0.0.0.0", port))
+            .await
+            .with_context(|| format!("cannot bind media port {port}"))?;
+        rtp.insert(port, Arc::new(socket));
     }
 
     let device_count = config.device.len();
@@ -309,7 +317,15 @@ async fn main() -> anyhow::Result<()> {
     });
 
     log(format!(
-        "started: sip={} media={}-{} devices={}",
+        "started: sip=0.0.0.0:{} (advertising {}) media={}-{} devices={}",
+        pbx.sip
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|port| port.to_string())
+            .collect::<Vec<_>>()
+            .join(",0.0.0.0:"),
         pbx.interfaces
             .iter()
             .map(|interface| interface.sip.to_string())
@@ -320,25 +336,25 @@ async fn main() -> anyhow::Result<()> {
         device_count
     ));
 
-    // SIP in and out, one task per interface.
-    for local in pbx.sip.keys().copied().collect::<Vec<_>>() {
+    // SIP in and out, one task per socket.
+    for local_port in pbx.sip.keys().copied().collect::<Vec<_>>() {
         let pbx = Arc::clone(&pbx);
         tokio::spawn(async move {
             let mut buffer = vec![0u8; SIP_BUFFER];
             loop {
-                match pbx.sip[&local].recv_from(&mut buffer).await {
-                    Ok((size, source)) => pbx.handle_sip(local, &buffer[..size], source).await,
+                match pbx.sip[&local_port].recv_from(&mut buffer).await {
+                    Ok((size, source)) => pbx.handle_sip(local_port, &buffer[..size], source).await,
                     Err(error) => log(format!("sip receive failed: {error}")),
                 }
             }
         });
     }
 
-    // Media in and out, one task per relay socket.
-    for (key, socket) in &pbx.rtp {
+    // Media in and out, one task per relay port.
+    for (port, socket) in &pbx.rtp {
         let pbx = Arc::clone(&pbx);
         let socket = Arc::clone(socket);
-        let port = key.1;
+        let port = *port;
         tokio::spawn(async move {
             let mut buffer = vec![0u8; RTP_BUFFER];
             loop {

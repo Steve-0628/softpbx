@@ -77,8 +77,8 @@ call_log = "/var/log/softpbx/calls.ndjson"
 # configured network is served from the first interface.
 [[interface]]
 network = "192.0.2.0/24"          # the peers served here
-sip = "192.0.2.10:5060"           # our SIP address here (listen + advertise)
-rtp = "192.0.2.10"                # our media address here (SDP)
+sip = "192.0.2.10:5060"           # what these peers see in Via/Contact
+rtp = "192.0.2.10"                # what these peers see in SDP
 
 #[[interface]]
 #network = "10.8.0.0/24"          # a second network (a VPN, say)
@@ -120,8 +120,10 @@ peer = "192.168.77.108:5060"
 A PBX on several networks gets one `[[interface]]` per network. Each peer is
 served from the interface whose `network` holds its address (the most specific
 match), and sees that interface's addresses in Via, Contact and SDP — so a call
-between a phone on the LAN and one on the VPN works in both directions. We
-listen on, and send from, the very addresses we advertise.
+between a phone on the LAN and one on the VPN works in both directions. The
+sockets listen on all local addresses at those ports; the advertised address
+need not even be ours (a NAT'd or routed address works as long as the traffic
+reaches us) — what the messages say is what makes each peer find us.
 
 One trap worth knowing: rules are **first-match**, so a broad `reject`
 pattern silently shadows device numbers (`1*` blocks 1001/1002 too). Keep

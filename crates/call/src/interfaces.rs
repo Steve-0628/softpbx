@@ -71,9 +71,11 @@ fn same_prefix(network: u128, peer: u128, prefix: u8, bits: u32) -> bool {
 pub struct Interface {
     /// The peers served here ("192.168.1.0/24").
     pub network: Network,
-    /// Our SIP address here: where we listen, and what Via/Contact advertise.
+    /// The SIP address these peers see in Via/Contact. The daemon listens
+    /// on its *port*, on all local addresses — the address itself need not
+    /// be ours (NAT'd or routed addresses work).
     pub sip: SocketAddr,
-    /// Our media address here (what SDP advertises).
+    /// The media address these peers see in SDP.
     pub rtp: IpAddr,
 }
 
