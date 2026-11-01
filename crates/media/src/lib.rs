@@ -46,13 +46,15 @@ impl Codec {
     }
 }
 
+use sip_syntax::Direction;
+
 /// The codecs we offer, in preference order (G.711 first, as docs/07 says).
 pub const OUR_CODECS: [Codec; 3] = [Codec::Pcmu, Codec::Pcma, Codec::TelephoneEvent];
 
 /// Builds the SDP body we send (offer or answer): one audio stream of G.711,
 /// 10 ms packets, no silence suppression.
 pub fn audio_sdp(connection_ip: &str, port: u16) -> Vec<u8> {
-    build_sdp(connection_ip, port, &OUR_CODECS)
+    build_sdp(connection_ip, port, &OUR_CODECS, None)
 }
 
 /// Our codecs, narrowed to the payload types a peer's SDP listed.
@@ -68,7 +70,16 @@ fn shared_codecs(offered_payload_types: &[u8]) -> Vec<Codec> {
 /// (RFC 3264 §6: answer with the intersection, never a codec they did not
 /// offer). If the offer shares none of ours, the stream is **declined**
 /// (`m=audio 0`) instead of answered with something they never offered.
-pub fn audio_sdp_answer(connection_ip: &str, port: u16, offered_payload_types: &[u8]) -> Vec<u8> {
+///
+/// `direction` is the reciprocal of the offer's (RFC 3264 §6): toward a
+/// held side we send nothing but keep receiving its music. `None` is plain
+/// `sendrecv` — no direction attribute on the wire.
+pub fn audio_sdp_answer(
+    connection_ip: &str,
+    port: u16,
+    offered_payload_types: &[u8],
+    direction: Option<Direction>,
+) -> Vec<u8> {
     let shared = shared_codecs(offered_payload_types);
     if shared.is_empty() {
         return format!(
@@ -81,7 +92,7 @@ pub fn audio_sdp_answer(connection_ip: &str, port: u16, offered_payload_types: &
         )
         .into_bytes();
     }
-    build_sdp(connection_ip, port, &shared)
+    build_sdp(connection_ip, port, &shared, direction)
 }
 
 /// Builds the SDP offer toward the far leg of a bridge, limited to the codecs
@@ -97,7 +108,7 @@ pub fn audio_sdp_offer(connection_ip: &str, port: u16, near_end_payload_types: &
     if shared.is_empty() {
         return audio_sdp(connection_ip, port);
     }
-    build_sdp(connection_ip, port, &shared)
+    build_sdp(connection_ip, port, &shared, None)
 }
 
 /// An SDP body declining media (RFC 3264 §6: `m=audio 0`).
@@ -113,12 +124,21 @@ pub fn declined_sdp(connection_ip: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-fn build_sdp(connection_ip: &str, port: u16, codecs: &[Codec]) -> Vec<u8> {
+fn build_sdp(
+    connection_ip: &str,
+    port: u16,
+    codecs: &[Codec],
+    direction: Option<Direction>,
+) -> Vec<u8> {
     let payload_types: Vec<String> = codecs
         .iter()
         .map(|codec| codec.payload_type().to_string())
         .collect();
     let rtpmaps: Vec<&str> = codecs.iter().map(|codec| codec.rtpmap()).collect();
+    let direction_line = match direction {
+        Some(direction) => format!("a={}\r\n", direction.attribute()),
+        None => String::new(),
+    };
     format!(
         "v=0\r\n\
          o=softpbx 1 1 IN IP4 {connection_ip}\r\n\
@@ -128,7 +148,8 @@ fn build_sdp(connection_ip: &str, port: u16, codecs: &[Codec]) -> Vec<u8> {
          m=audio {port} RTP/AVP {}\r\n\
          {}\r\n\
          a=ptime:10\r\n\
-         a=silenceSupp:off\r\n\r\n",
+         a=silenceSupp:off\r\n\
+         {direction_line}\r\n",
         payload_types.join(" "),
         rtpmaps.join("\r\n"),
     )

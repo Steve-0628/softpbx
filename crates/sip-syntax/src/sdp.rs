@@ -1,8 +1,9 @@
-//! SDP parsing (RFC 4566) — the subset we need: media lines.
+//! SDP parsing (RFC 4566) — the subset we need: media lines, connection
+//! lines and direction attributes.
 //!
-//! Everything except `m=` lines is ignored. That is deliberate: we only need to
-//! know "what media, where, transported how, which payload types" to answer an
-//! offer (docs/07).
+//! Everything else is ignored. That is deliberate: we only need to know
+//! "what media, where, transported how, which payload types, which
+//! direction" to answer an offer (docs/07).
 
 use crate::parse::split_line;
 use crate::ParseError;
@@ -12,6 +13,53 @@ use crate::ParseError;
 pub struct Sdp {
     /// One entry per `m=` line.
     pub media: Vec<MediaDescription>,
+}
+
+/// A media direction attribute (RFC 3264 §6): what the SDP's sender will do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Sends and receives — the default when no attribute is present.
+    SendRecv,
+    /// Sends only. A hold this way keeps streaming (music on hold) toward
+    /// the far side.
+    SendOnly,
+    /// Receives only.
+    RecvOnly,
+    /// Neither: a hold in both directions.
+    Inactive,
+}
+
+impl Direction {
+    /// The `a=` attribute value for this direction.
+    pub fn attribute(self) -> &'static str {
+        match self {
+            Direction::SendRecv => "sendrecv",
+            Direction::SendOnly => "sendonly",
+            Direction::RecvOnly => "recvonly",
+            Direction::Inactive => "inactive",
+        }
+    }
+
+    /// The direction an `a=` attribute value names, if any.
+    fn parse(value: &str) -> Option<Direction> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "sendrecv" => Some(Direction::SendRecv),
+            "sendonly" => Some(Direction::SendOnly),
+            "recvonly" => Some(Direction::RecvOnly),
+            "inactive" => Some(Direction::Inactive),
+            _ => None,
+        }
+    }
+
+    /// Whether media from this side is sent onward.
+    pub fn sends(self) -> bool {
+        matches!(self, Direction::SendRecv | Direction::SendOnly)
+    }
+
+    /// Whether media toward this side is delivered.
+    pub fn receives(self) -> bool {
+        matches!(self, Direction::SendRecv | Direction::RecvOnly)
+    }
 }
 
 /// One `m=` media description.
@@ -28,6 +76,9 @@ pub struct MediaDescription {
     pub payload_types: Vec<u8>,
     /// Connection address (`c=`): media-level if present, else session-level.
     pub connection: Option<String>,
+    /// Direction (`a=sendonly` etc.): media-level if present, else
+    /// session-level. `None` is `sendrecv` (RFC 3264 §5).
+    pub direction: Option<Direction>,
 }
 
 const MAX_SDP_LINE: usize = 8_192;
@@ -38,6 +89,7 @@ const MAX_MEDIA: usize = 64;
 pub fn parse_sdp(input: &[u8]) -> Result<Sdp, ParseError> {
     let mut media = Vec::new();
     let mut session_connection: Option<String> = None;
+    let mut session_direction: Option<Direction> = None;
     let mut current: Option<MediaDescription> = None;
     let mut rest = input;
     while !rest.is_empty() {
@@ -62,12 +114,21 @@ pub fn parse_sdp(input: &[u8]) -> Result<Sdp, ParseError> {
             }
             let mut description = parse_media_line(fields)?;
             description.connection = session_connection.clone();
+            description.direction = session_direction;
             current = Some(description);
         } else if let Some(fields) = line.strip_prefix(b"c=") {
             let address = parse_connection_line(fields);
             match &mut current {
                 Some(description) => description.connection = Some(address),
                 None => session_connection = Some(address),
+            }
+        } else if let Some(fields) = line.strip_prefix(b"a=") {
+            let value = String::from_utf8_lossy(fields);
+            if let Some(direction) = Direction::parse(&value) {
+                match &mut current {
+                    Some(description) => description.direction = Some(direction),
+                    None => session_direction = Some(direction),
+                }
             }
         }
     }
@@ -132,5 +193,6 @@ fn parse_media_line(fields: &[u8]) -> Result<MediaDescription, ParseError> {
             .to_string(),
         payload_types,
         connection: None,
+        direction: None,
     })
 }

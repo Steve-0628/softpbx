@@ -21,7 +21,9 @@ use sip_stack::{
     ack_for_2xx, cseq_parts, make_response, tag_of, uri_of, with_tag, Action, ClientTransaction,
     Dialog, ServerState, ServerTransaction, Timer,
 };
-use sip_syntax::{canonical_header, parse_sdp, Header, Message, Method, Request, Response};
+use sip_syntax::{
+    canonical_header, parse_sdp, Direction, Header, Message, Method, Request, Response,
+};
 
 use crate::call::{transit, CallEvent, CallState, Command};
 use crate::interfaces::{interface_for, Interface};
@@ -111,6 +113,13 @@ struct LegMedia {
     peer_addr: String,
     /// Where its packets actually come from (symmetric RTP), when known.
     learned: Option<String>,
+    /// Whether this side's media is relayed to the other leg: its SDP says
+    /// it sends (`sendrecv`/`sendonly`). A side on hold may still send —
+    /// its hold music must reach the far side.
+    sends: bool,
+    /// Whether media from the other leg is relayed to it: its SDP says it
+    /// receives, and its stream is not declined.
+    receives: bool,
 }
 
 impl LegMedia {
@@ -129,11 +138,16 @@ struct CallMedia {
     /// Payload types the callee's answer committed the bridge to. Both legs
     /// must run the same codec: the relay does not transcode (docs/02 §8).
     callee_payloads: Vec<u8>,
-    /// A declined stream (hold) stops the relay in both directions.
-    paused: bool,
 }
 
 impl CallMedia {
+    /// Whether some side is not fully sending and receiving — a hold in
+    /// effect (RFC 3264 §6).
+    fn held(&self) -> bool {
+        let full = |leg: &LegMedia| leg.sends && leg.receives;
+        !(full(&self.caller) && full(&self.callee))
+    }
+
     /// The payload types an answer toward the caller may contain: never wider
     /// than what the callee's answer committed to (RFC 3264 §6 still applies —
     /// and a codec the callee refused would be relayed as garbage).
@@ -237,7 +251,7 @@ impl Switch {
             .iter()
             .filter(|(_, call)| {
                 call.state == CallState::Answered
-                    && call.media.as_ref().is_some_and(|media| !media.paused)
+                    && call.media.as_ref().is_some_and(|media| !media.held())
                     && now_ms.saturating_sub(call.last_media_ms) >= MEDIA_TIMEOUT_MS
             })
             .map(|(id, _)| *id)
@@ -750,23 +764,31 @@ impl Switch {
             return outputs;
         }
 
-        // Media: if the caller offered audio, we relay it (docs/02 §8).
+        // Media: if the caller offered audio, we relay it (docs/02 §8). The
+        // offer's direction attributes say what the caller sends and
+        // receives (RFC 3264 §6).
         let media = match media_target(&request.body) {
             Some(peer_addr) => match self.allocate_media_ports() {
-                Some((caller_port, callee_port)) => Some(CallMedia {
-                    caller: LegMedia {
-                        our_port: caller_port,
-                        peer_addr,
-                        learned: None,
-                    },
-                    callee: LegMedia {
-                        our_port: callee_port,
-                        peer_addr: String::new(),
-                        learned: None,
-                    },
-                    callee_payloads: Vec::new(),
-                    paused: false,
-                }),
+                Some((caller_port, callee_port)) => {
+                    let (sends, receives) = media_stance(&request.body).unwrap_or((true, true));
+                    Some(CallMedia {
+                        caller: LegMedia {
+                            our_port: caller_port,
+                            peer_addr,
+                            learned: None,
+                            sends,
+                            receives,
+                        },
+                        callee: LegMedia {
+                            our_port: callee_port,
+                            peer_addr: String::new(),
+                            learned: None,
+                            sends: true,
+                            receives: true,
+                        },
+                        callee_payloads: Vec::new(),
+                    })
+                }
                 None => {
                     let response = tagged(
                         make_response(&request, 503, "Service Unavailable"),
@@ -983,17 +1005,19 @@ impl Switch {
             }
         }
 
-        // A re-INVITE that moves media moves our relay target with it
-        // (RFC 3264); a declined stream (port 0 / c=0.0.0.0) stops it.
+        // A re-INVITE that moves media moves our relay target with it, and
+        // its direction attributes (RFC 3264 §6) say what this side sends
+        // and receives. A hold stops only the direction *toward* the held
+        // side — the holder's own media (its hold music) still reaches the
+        // far side — and a resumed side starts the pair flowing again.
         if !request.body.is_empty() {
             let moved = media_target(&request.body);
-            let declined = declined_media(&request.body);
-            if moved.is_some() || declined {
+            let stance = media_stance(&request.body);
+            if moved.is_some() || stance.is_some() {
                 if let Some(call) = self.calls.get_mut(&id) {
                     let mut resumed = false;
                     if let Some(media) = call.media.as_mut() {
-                        resumed = media.paused && !declined;
-                        media.paused = declined;
+                        let was_held = media.held();
                         let leg = match leg {
                             Leg::Caller => &mut media.caller,
                             Leg::Callee => &mut media.callee,
@@ -1002,6 +1026,11 @@ impl Switch {
                             leg.peer_addr = address;
                             leg.learned = None;
                         }
+                        if let Some((sends, receives)) = stance {
+                            leg.sends = sends;
+                            leg.receives = receives;
+                        }
+                        resumed = was_held && !media.held();
                     }
                     if resumed {
                         // Media flows again: restart the inactivity clock, or
@@ -1015,8 +1044,8 @@ impl Switch {
         let mut response = tagged(make_response(&request, 200, "OK"), &our_tag);
         if !request.body.is_empty() {
             let rtp_host = self.local(peer).rtp.to_string();
-            if declined_media(&request.body) {
-                // A declined stream gets a declined answer (RFC 3264 §6).
+            if stream_withdrawn(&request.body) {
+                // A withdrawn stream is mirrored as withdrawn (RFC 3264 §6).
                 response.headers.push(Header {
                     name: "Content-Type".to_string(),
                     value: "application/sdp".to_string(),
@@ -1030,11 +1059,15 @@ impl Switch {
                     Some(media) => media.answerable_payloads(offered),
                     None => offered,
                 };
+                // Our direction is the reciprocal of theirs (RFC 3264 §6):
+                // toward a held side we send nothing but keep receiving its
+                // music.
+                let direction = reciprocal_direction(media_stance(&request.body));
                 response.headers.push(Header {
                     name: "Content-Type".to_string(),
                     value: "application/sdp".to_string(),
                 });
-                response.body = media::audio_sdp_answer(&rtp_host, port, &answer);
+                response.body = media::audio_sdp_answer(&rtp_host, port, &answer, direction);
             }
         }
         let actions = tx.on_response_from_user(response, now_ms);
@@ -1273,15 +1306,18 @@ impl Switch {
         let Some(media) = call.media.as_mut() else {
             return vec![];
         };
-        if media.paused {
-            return vec![]; // the call is on hold: silence on purpose
-        }
         let (source, target) = match leg {
             Leg::Caller => (&mut media.caller, &media.callee),
             Leg::Callee => (&mut media.callee, &media.caller),
         };
         // Symmetric RTP: whoever speaks is where their media goes back to.
         source.learned = Some(from.to_string());
+        // Only what a side sends, and only toward a side that receives
+        // (RFC 3264 §6). A hold stops one direction, not the pipe: the
+        // holder's own media — its hold music — still reaches the far side.
+        if !(source.sends && target.receives) {
+            return vec![];
+        }
         let Some(to) = target.send_to() else {
             return vec![]; // the other side has not spoken yet
         };
@@ -1340,9 +1376,14 @@ impl Switch {
                         // Where their media lives (from their SDP) — including
                         // 183 early media (docs/06: inband announcements). A
                         // live stream is also their codec choice, and that pins
-                        // what we may answer toward the caller.
-                        if let Some(peer_addr) = media_target(&response.body) {
-                            if let Some(media) = call.media.as_mut() {
+                        // what we may answer toward the caller. Their
+                        // direction attributes say what they send and receive.
+                        if let Some(media) = call.media.as_mut() {
+                            if let Some((sends, receives)) = media_stance(&response.body) {
+                                media.callee.sends = sends;
+                                media.callee.receives = receives;
+                            }
+                            if let Some(peer_addr) = media_target(&response.body) {
                                 media.callee.peer_addr = peer_addr;
                                 let payload_types = sdp_payload_types(&response.body);
                                 if !payload_types.is_empty() {
@@ -1604,12 +1645,19 @@ impl Switch {
                     // two legs run different codecs and the audio arrive as
                     // garbage.
                     let answer = media.answerable_payloads(offered);
+                    // Our direction is the reciprocal of their offer's
+                    // (RFC 3264 §6).
+                    let direction = reciprocal_direction(media_stance(&call.caller_invite.body));
                     response.headers.push(Header {
                         name: "Content-Type".to_string(),
                         value: "application/sdp".to_string(),
                     });
-                    response.body =
-                        media::audio_sdp_answer(&rtp_host, media.caller.our_port, &answer);
+                    response.body = media::audio_sdp_answer(
+                        &rtp_host,
+                        media.caller.our_port,
+                        &answer,
+                        direction,
+                    );
                 }
                 call.caller_tx.on_response_from_user(response, now_ms)
             }
@@ -1919,22 +1967,41 @@ fn unsupported_require(request: &Request) -> Vec<String> {
     tags
 }
 
-/// Whether an SDP body declines its media (RFC 3264: `m=audio 0` or
-/// `c=0.0.0.0`).
-fn declined_media(body: &[u8]) -> bool {
-    let Ok(sdp) = parse_sdp(body) else {
-        return false;
-    };
-    sdp.media
-        .iter()
-        .any(|media| media.media == "audio" && media.port == 0)
-        || sdp.media.iter().any(|media| {
-            media
-                .connection
-                .as_deref()
-                .map(|address| address == "0.0.0.0")
-                .unwrap_or(false)
-        })
+/// What an SDP body says about the audio its sender will carry (RFC 3264
+/// §6): whether media *from* it is sent onward, and whether media is
+/// delivered *to* it. `None` when the body names no audio stream.
+///
+/// A declined stream (`c=0.0.0.0` / `m=audio 0`) receives nothing — but
+/// phones on hold keep streaming their music from behind one, so what they
+/// send is still relayed (the transparent pipe, docs/02 §8).
+fn media_stance(body: &[u8]) -> Option<(bool, bool)> {
+    let sdp = parse_sdp(body).ok()?;
+    let audio = sdp.media.iter().find(|media| media.media == "audio")?;
+    let direction = audio.direction.unwrap_or(Direction::SendRecv);
+    let declined = audio.port == 0 || audio.connection.as_deref() == Some("0.0.0.0");
+    Some((direction.sends(), direction.receives() && !declined))
+}
+
+/// Whether an SDP body withdraws its audio stream (`m=audio 0`): the stream
+/// is gone (RFC 3264 §6) and our answer mirrors that.
+fn stream_withdrawn(body: &[u8]) -> bool {
+    parse_sdp(body).is_ok_and(|sdp| {
+        sdp.media
+            .iter()
+            .any(|media| media.media == "audio" && media.port == 0)
+    })
+}
+
+/// The direction our answer takes toward a peer with this stance (RFC 3264
+/// §6): we send what it receives and receive what it sends. `None` is plain
+/// `sendrecv` — no direction attribute on the wire.
+fn reciprocal_direction(stance: Option<(bool, bool)>) -> Option<Direction> {
+    match stance? {
+        (true, true) => None,
+        (true, false) => Some(Direction::RecvOnly),
+        (false, true) => Some(Direction::SendOnly),
+        (false, false) => Some(Direction::Inactive),
+    }
 }
 
 /// Payload type numbers an SDP body offers, for codec intersection.

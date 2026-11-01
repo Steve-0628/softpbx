@@ -4,7 +4,7 @@
 
 use sip_syntax::{
     canonical_header, parse_message, parse_message_with_limits, parse_sdp, serialize_message,
-    Limits, Message, Method, ParseError,
+    Direction, Limits, Message, Method, ParseError,
 };
 
 fn invite_body() -> Vec<u8> {
@@ -334,6 +334,44 @@ fn sdp_without_trailing_newline_parses() {
 fn sdp_ignores_non_media_lines() {
     let sdp = parse_sdp(b"v=0\r\nweird line without equals\r\ns=-\r\n").unwrap();
     assert!(sdp.media.is_empty());
+}
+
+#[test]
+fn sdp_direction_attributes_parse() {
+    // Media-level: what the hold forms in the wild actually send.
+    let sdp = parse_sdp(
+        b"v=0\r\n\
+          c=IN IP4 192.0.2.1\r\n\
+          m=audio 5004 RTP/AVP 0\r\n\
+          a=sendonly\r\n",
+    )
+    .unwrap();
+    assert_eq!(sdp.media[0].direction, Some(Direction::SendOnly));
+
+    // Session-level applies to the streams below it...
+    let sdp = parse_sdp(
+        b"v=0\r\n\
+          a=inactive\r\n\
+          m=audio 5004 RTP/AVP 0\r\n\
+          m=image 6004 udptl t38\r\n",
+    )
+    .unwrap();
+    assert_eq!(sdp.media[0].direction, Some(Direction::Inactive));
+    assert_eq!(sdp.media[1].direction, Some(Direction::Inactive));
+
+    // ...but a media-level attribute overrides it.
+    let sdp = parse_sdp(
+        b"v=0\r\n\
+          a=sendonly\r\n\
+          m=audio 5004 RTP/AVP 0\r\n\
+          a=recvonly\r\n",
+    )
+    .unwrap();
+    assert_eq!(sdp.media[0].direction, Some(Direction::RecvOnly));
+
+    // No attribute is plain sendrecv, and other attributes stay ignored.
+    let sdp = parse_sdp(b"m=audio 5004 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n").unwrap();
+    assert_eq!(sdp.media[0].direction, None);
 }
 
 #[test]

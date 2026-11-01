@@ -217,6 +217,23 @@ fn sdp_body_with_payloads(media: &str, payloads: &str) -> Vec<u8> {
     text.into_bytes()
 }
 
+/// SDP carrying an explicit direction attribute (hold: `a=sendonly`).
+fn sdp_body_directed(media: &str, direction: &str) -> Vec<u8> {
+    let (ip, port) = media.split_once(':').expect("ip:port");
+    format!(
+        "v=0\r\n\
+         o=phone 1 1 IN IP4 {ip}\r\n\
+         s=-\r\n\
+         c=IN IP4 {ip}\r\n\
+         t=0 0\r\n\
+         m=audio {port} RTP/AVP 0 8 101\r\n\
+         a=rtpmap:0 PCMU/8000\r\n\
+         a={direction}\r\n\
+         a=ptime:10\r\n"
+    )
+    .into_bytes()
+}
+
 fn register_bytes(number: &str, contact: &str, authorization: Option<&str>) -> Vec<u8> {
     let mut text = format!(
         "REGISTER {PBX_URI} SIP/2.0\r\n\
@@ -1680,9 +1697,11 @@ fn regression_ghost_reinvite_gets_481() {
     assert_eq!(switch.active_calls(), 0);
 }
 
-/// A hold (declined stream) stops the media and gets a declined answer.
+/// A hold stops only the media *toward* the holder — the holder's own media
+/// (its hold music) still reaches the far side. A withdrawn stream gets a
+/// withdrawn answer (RFC 3264 §6).
 #[test]
-fn regression_hold_stops_media() {
+fn regression_hold_relays_the_holders_media() {
     let mut world = World::with_seed(0x5EED);
     let mut switch = switch();
     register_both(&mut world, &mut switch);
@@ -1701,7 +1720,7 @@ fn regression_hold_stops_media() {
     let body = String::from_utf8_lossy(&answered.body);
     assert!(body.contains("m=audio 0"), "the answer declines: {body}");
 
-    // Nothing is relayed in either direction while held.
+    // The holder's media (hold music) still reaches the far side...
     let packet = Packet::build(false, 0, 1, 160, 9, &[0xff; 80]);
     let outputs = switch.on_rtp(
         call.caller_relay_port,
@@ -1709,16 +1728,26 @@ fn regression_hold_stops_media() {
         packet.to_bytes(),
         0,
     );
-    assert!(rtp_forwards(&outputs).is_empty(), "held means held");
+    let forwards = rtp_forwards(&outputs);
+    assert_eq!(forwards.len(), 1, "hold music is relayed: {outputs:?}");
+    assert_eq!(
+        forwards[0].0, "192.0.2.2:20000",
+        "to the far side of the bridge"
+    );
+
+    // ...while the far side's media does not reach the holder.
     let outputs = switch.on_rtp(
         call.callee_relay_port,
         &call.callee_media,
         packet.to_bytes(),
         0,
     );
-    assert!(rtp_forwards(&outputs).is_empty(), "held means held");
+    assert!(
+        rtp_forwards(&outputs).is_empty(),
+        "nothing toward the holder"
+    );
 
-    // A resume (active media again) restores the relay.
+    // A resume (active media again) restores the relay both ways.
     let resume = reinvite_bytes(
         &call.call_id,
         "1001",
@@ -1738,6 +1767,141 @@ fn regression_hold_stops_media() {
     let forwards = rtp_forwards(&outputs);
     assert_eq!(forwards.len(), 1, "resume restores the relay: {outputs:?}");
     assert_eq!(forwards[0].0, "192.0.2.1:11000", "to the new address");
+}
+
+/// RFC 3264 hold (`a=sendonly` with a real address): the answer is
+/// `a=recvonly` and the holder's music flows; the reverse direction stops.
+#[test]
+fn regression_sendonly_hold_relays_music() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let call = establish_call(
+        &mut world,
+        &mut switch,
+        "hold-sendonly",
+        "1001",
+        "1002",
+        "192.0.2.1:10000",
+        "192.0.2.2:20000",
+    );
+    let hold = reinvite_with_body(
+        &call.call_id,
+        "1001",
+        "from1",
+        &call.to_tag,
+        2,
+        &sdp_body_directed("192.0.2.1:10500", "sendonly"),
+    );
+    let outputs = feed(&mut world, &mut switch, &hold);
+    let answered = response_of(&outputs, 200);
+    let body = String::from_utf8_lossy(&answered.body);
+    assert!(!body.contains("m=audio 0"), "the stream stays up: {body}");
+    assert!(body.contains("a=recvonly"), "we receive only: {body}");
+    assert!(
+        body.contains(&format!("m=audio {}", call.caller_relay_port)),
+        "our relay port toward the holder: {body}"
+    );
+
+    let packet = Packet::build(false, 0, 1, 160, 9, &[0xff; 80]);
+    let outputs = switch.on_rtp(
+        call.caller_relay_port,
+        "192.0.2.1:10500",
+        packet.to_bytes(),
+        0,
+    );
+    let forwards = rtp_forwards(&outputs);
+    assert_eq!(forwards.len(), 1, "hold music is relayed: {outputs:?}");
+    assert_eq!(forwards[0].0, "192.0.2.2:20000");
+    let outputs = switch.on_rtp(
+        call.callee_relay_port,
+        &call.callee_media,
+        packet.to_bytes(),
+        0,
+    );
+    assert!(
+        rtp_forwards(&outputs).is_empty(),
+        "nothing toward the holder"
+    );
+
+    // Resume: plain sendrecv again, both directions restored.
+    let resume = reinvite_bytes(
+        &call.call_id,
+        "1001",
+        "from1",
+        &call.to_tag,
+        3,
+        "192.0.2.1:11000",
+    );
+    let outputs = feed(&mut world, &mut switch, &resume);
+    let answered = response_of(&outputs, 200);
+    let body = String::from_utf8_lossy(&answered.body);
+    assert!(
+        !body.contains("a=recvonly"),
+        "no direction on resume: {body}"
+    );
+    let outputs = switch.on_rtp(
+        call.callee_relay_port,
+        &call.callee_media,
+        packet.to_bytes(),
+        0,
+    );
+    assert_eq!(rtp_forwards(&outputs).len(), 1, "the relay is back");
+}
+
+/// RFC 2543-style hold (`c=0.0.0.0` + `a=sendonly` — what real IP phones
+/// send) while the phone keeps streaming its hold music: the music must
+/// reach the far side instead of being dropped with the declined address.
+#[test]
+fn regression_0000_hold_still_relays_music() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_both(&mut world, &mut switch);
+    let call = establish_call(
+        &mut world,
+        &mut switch,
+        "hold-2543",
+        "1001",
+        "1002",
+        "192.0.2.1:10000",
+        "192.0.2.2:20000",
+    );
+    let hold = reinvite_with_body(
+        &call.call_id,
+        "1001",
+        "from1",
+        &call.to_tag,
+        2,
+        &sdp_body_directed("0.0.0.0:5004", "sendonly"),
+    );
+    let outputs = feed(&mut world, &mut switch, &hold);
+    let answered = response_of(&outputs, 200);
+    let body = String::from_utf8_lossy(&answered.body);
+    assert!(!body.contains("m=audio 0"), "the stream stays up: {body}");
+    assert!(body.contains("a=recvonly"), "we receive only: {body}");
+
+    // The phone streams its hold music from a real address regardless of the
+    // 0.0.0.0 it advertised — the far side must hear it.
+    let packet = Packet::build(false, 0, 1, 160, 9, &[0xff; 80]);
+    let outputs = switch.on_rtp(
+        call.caller_relay_port,
+        &call.caller_media,
+        packet.to_bytes(),
+        0,
+    );
+    let forwards = rtp_forwards(&outputs);
+    assert_eq!(forwards.len(), 1, "hold music is relayed: {outputs:?}");
+    assert_eq!(forwards[0].0, "192.0.2.2:20000");
+    let outputs = switch.on_rtp(
+        call.callee_relay_port,
+        &call.callee_media,
+        packet.to_bytes(),
+        0,
+    );
+    assert!(
+        rtp_forwards(&outputs).is_empty(),
+        "nothing toward the holder"
+    );
 }
 
 /// 183 early media carries an SDP — learn it, or the caller is deaf.
@@ -1856,7 +2020,18 @@ fn reinvite_bytes(
     cseq: u32,
     media: &str,
 ) -> Vec<u8> {
-    let body = sdp_body(media);
+    reinvite_with_body(call_id, from, from_tag, to_tag, cseq, &sdp_body(media))
+}
+
+/// The same re-INVITE carrying an explicit body (hold tests).
+fn reinvite_with_body(
+    call_id: &str,
+    from: &str,
+    from_tag: &str,
+    to_tag: &str,
+    cseq: u32,
+    body: &[u8],
+) -> Vec<u8> {
     let mut text = format!(
         "INVITE {PBX_URI} SIP/2.0\r\n\
          Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-reinvite-{call_id}\r\n\
@@ -1870,7 +2045,7 @@ fn reinvite_bytes(
          Content-Length: {}\r\n\r\n",
         body.len()
     );
-    text.push_str(&String::from_utf8(body).unwrap());
+    text.push_str(std::str::from_utf8(body).unwrap());
     text.into_bytes()
 }
 

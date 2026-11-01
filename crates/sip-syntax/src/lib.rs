@@ -13,7 +13,7 @@ mod sdp;
 mod serialize;
 
 pub use parse::{parse_message, parse_message_with_limits};
-pub use sdp::{parse_sdp, MediaDescription, Sdp};
+pub use sdp::{parse_sdp, Direction, MediaDescription, Sdp};
 pub use serialize::serialize_message;
 
 /// SIP version. Only SIP/2.0 exists.

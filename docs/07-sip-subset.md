@@ -70,15 +70,21 @@ for now: hold and transfer are not in the first phase, docs/01.)
 
 ### Offer/answer and SDP
 - The RFC 3264 exchange, once per call leg (we re-originate both sides).
-- SDP subset: we *parse* the media and connection lines (`m=`, `c=`) and
+- SDP subset: we *parse* the media and connection lines (`m=`, `c=`), the
+  direction attributes (`a=sendonly`/`recvonly`/`inactive`/`sendrecv`), and
   match codecs by payload type; we *emit* `a=rtpmap` for **G.711 (PCMU/PCMA)**
-  and **telephone-event**, `a=ptime`, `a=silenceSupp:off`.
-- Unknown SDP lines and attributes — including direction attributes — are
-  ignored. Unknown codecs are not offered and are declined in answers.
-- re-INVITE that phones occasionally send mid-call (codec refresh, session
-  refresh, quirks): accepted and answered. A media move in the offer moves our
-  relay target; a declined stream (`c=0.0.0.0` / `m=audio 0`) pauses the relay
-  in both directions until an active offer resumes it.
+  and **telephone-event**, `a=ptime`, `a=silenceSupp:off`, and a direction
+  attribute when it is not `sendrecv`.
+- Unknown SDP lines and attributes are ignored. Unknown codecs are not
+  offered and are declined in answers.
+- re-INVITE that phones occasionally send mid-call (hold, resume, codec
+  refresh, session refresh, quirks): accepted and answered. A media move in
+  the offer moves our relay target. Hold (`a=sendonly`/`recvonly`/`inactive`,
+  or a declined stream `c=0.0.0.0` / `m=audio 0`) stops only the media
+  *toward* the held side — the holder's own media (its hold music) still
+  reaches the far side — and our answer carries the reciprocal direction
+  (a withdrawn stream is mirrored as withdrawn). An active offer resumes the
+  pair. Held calls are exempt from the media-timeout sweep.
 
 ### Response codes we use
 
@@ -124,7 +130,6 @@ Rejected with a standard error response or ignored:
 | Session timers (RFC 4028) | A peer that turns out to need them. Policy: **we never claim the extension** — an INVITE carrying `Session-Expires` is answered *without* it (the peer then runs no timer or self-refreshes), and `Require: timer` gets `420` like anything unsupported. This is coherent with "never half an extension": claiming `refresher=uac` over a UAC's `refresher=uas` would violate §9 Table 2, and implementing the UAS side obliges us to refresh. (MikoPBX, our actual peer, sends none — one peer's capture, not a law of nature.) |
 | TCP transport | A real device that cannot do UDP (none expected at this size) |
 | `183` early media handling | Trunk or gateway interop shows it matters |
-| Direction attributes (`sendonly` etc.) | Hold / music-on-hold |
 
 ## 4. Ground rules for growing the list
 
