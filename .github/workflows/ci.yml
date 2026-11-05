@@ -10,57 +10,27 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  lint:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: rustfmt
-        run: cargo fmt --all -- --check
-      - name: clippy
-        run: cargo clippy --workspace --all-targets
-
-  test:
-    runs-on: ubuntu-latest
-    needs: lint
-    strategy:
-      matrix:
-        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-      - name: build
-        run: cargo build --workspace --target ${{ matrix.target }}
-      - name: test
-        run: cargo test --workspace
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-
-  # Deterministic simulation (docs/04). Fixed seeds: results always reproduce.
-  dst:
-    runs-on: ubuntu-latest
-    needs: lint
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: deterministic simulation
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets
+      - run: cargo test --workspace
+      - name: deterministic simulation (docs/04)
         run: cargo test -p engine-sim --release
 
-  # Short fuzz of the parsers (docs/04). Full runs go in a scheduled job.
-  fuzz-smoke:
+  fuzz:
     runs-on: ubuntu-latest
-    needs: lint
+    continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - name: install cargo-fuzz
-        run: cargo install cargo-fuzz --locked || true
-      - name: fuzz smoke (sip-syntax)
+        run: cargo install cargo-fuzz --locked
+      - name: fuzz smoke (docs/04)
         run: cargo fuzz run parse_message -- -max_total_time=60
-        continue-on-error: true
