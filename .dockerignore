@@ -1,0 +1,23 @@
+# Build artifacts and VCS metadata are not part of the image.
+.git
+.github
+target
+
+# Not needed to build the binary.
+docs
+fuzz
+
+# Local runtime data and logs must never end up in an image.
+calls.ndjson
+*.ndjson
+*.log
+/var/
+/data/
+
+# Editor and OS noise
+.idea
+.vscode
+*.swp
+core
+core.*
+*.core
