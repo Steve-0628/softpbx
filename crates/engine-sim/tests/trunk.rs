@@ -7,7 +7,9 @@
 
 use std::net::SocketAddr;
 
-use call::{Action, Device, Interface, Network, Output, Rule, Switch, SwitchConfig, TrunkConfig};
+use call::{
+    Action, Device, Interface, Network, Output, Rule, Switch, SwitchConfig, TrunkAuth, TrunkConfig,
+};
 use engine_sim::{Event, World};
 use sip_stack::digest::{expected_response, Credentials};
 use sip_stack::{make_response, tag_of};
@@ -17,6 +19,10 @@ const REALM: &str = "softpbx";
 const PBX_URI: &str = "sip:192.0.2.10";
 const PBX_HOST: &str = "192.0.2.10:5060";
 const PEER: &str = "192.168.77.108:5060"; // the captured MikoPBX address
+const TRUNK_IN_USER: &str = "mikopbx-in";
+const TRUNK_IN_SECRET: &str = "inbound-secret";
+const TRUNK_OUT_USER: &str = "trunkuser";
+const TRUNK_OUT_SECRET: &str = "trunkpass";
 
 fn peer_addr() -> SocketAddr {
     PEER.parse().expect("peer address")
@@ -47,8 +53,14 @@ fn switch() -> Switch {
         trunks: vec![TrunkConfig {
             name: "mikopbx".to_string(),
             peer: peer_addr(),
-            username: None,
-            secret: None,
+            outbound: Some(TrunkAuth {
+                username: TRUNK_OUT_USER.to_string(),
+                secret: TRUNK_OUT_SECRET.to_string(),
+            }),
+            inbound: Some(TrunkAuth {
+                username: TRUNK_IN_USER.to_string(),
+                secret: TRUNK_IN_SECRET.to_string(),
+            }),
         }],
         devices: vec![
             Device {
@@ -301,8 +313,8 @@ fn trunk_inbound_call_rings_the_device() {
     register_device(&mut world, &mut switch, "1002", "bob-secret");
 
     // The peer calls 1002. Its caller (3001) is NOT registered here — a trunk
-    // caller is identified by its address, not by registration.
-    let outputs = feed_from(
+    // caller authenticates with digest credentials, not by registration.
+    let outputs = authenticate_peer(
         &mut world,
         &mut switch,
         &peer_invite("3001", "1002", "trunk-in"),
@@ -341,20 +353,24 @@ fn trunk_inbound_call_rings_the_device() {
 }
 
 #[test]
-fn trunk_inbound_from_a_stranger_is_refused() {
+fn trunk_inbound_from_a_stranger_is_challenged() {
     let mut world = World::with_seed(0x5EED);
     let mut switch = switch();
     register_device(&mut world, &mut switch, "1002", "bob-secret");
 
-    // The same INVITE from a random address: not a trunk peer, caller not
-    // registered — refused as usual.
+    // The same INVITE from a random address, without credentials: the caller
+    // is not registered and cannot authenticate as a trunk — challenge it.
     let outputs = feed_from(
         &mut world,
         &mut switch,
         &peer_invite("3001", "1002", "stranger"),
         "10.9.9.9:5060".parse().ok(),
     );
-    assert_eq!(response_of(&outputs, 403).status, 403);
+    assert_eq!(response_of(&outputs, 401).status, 401);
+    assert!(
+        header_value(&response_of(&outputs, 401).headers, "WWW-Authenticate").is_some(),
+        "the challenge carries WWW-Authenticate"
+    );
     assert!(requests_of(&outputs, Method::Invite).is_empty());
 }
 
@@ -363,7 +379,7 @@ fn trunk_inbound_bye_from_peer_ends_the_call() {
     let mut world = World::with_seed(0x5EED);
     let mut switch = switch();
     register_device(&mut world, &mut switch, "1002", "bob-secret");
-    let outputs = feed_from(
+    let outputs = authenticate_peer(
         &mut world,
         &mut switch,
         &peer_invite("3001", "1002", "trunk-in-bye"),
@@ -482,8 +498,11 @@ fn trunk_peer_challenge_is_answered_with_credentials() {
         trunks: vec![TrunkConfig {
             name: "mikopbx".to_string(),
             peer: peer_addr(),
-            username: Some("trunkuser".to_string()),
-            secret: Some("trunkpass".to_string()),
+            outbound: Some(TrunkAuth {
+                username: TRUNK_OUT_USER.to_string(),
+                secret: TRUNK_OUT_SECRET.to_string(),
+            }),
+            inbound: None,
         }],
         ..switch_config_base()
     });
@@ -540,8 +559,11 @@ fn trunk_auth_failure_maps_to_503() {
         trunks: vec![TrunkConfig {
             name: "mikopbx".to_string(),
             peer: peer_addr(),
-            username: Some("trunkuser".to_string()),
-            secret: Some("wrongpass".to_string()),
+            outbound: Some(TrunkAuth {
+                username: TRUNK_OUT_USER.to_string(),
+                secret: "wrongpass".to_string(),
+            }),
+            inbound: None,
         }],
         ..switch_config_base()
     });
@@ -599,7 +621,7 @@ fn trunk_cannot_impersonate_local_devices() {
         "From: <sip:1001@192.0.2.10>;tag=far1",
     );
     forged = text.into_bytes();
-    let outputs = feed_from(&mut world, &mut switch, &forged, Some(peer_addr()));
+    let outputs = authenticate_peer(&mut world, &mut switch, &forged, Some(peer_addr()));
     assert_eq!(response_of(&outputs, 403).status, 403, "{outputs:?}");
     let logs = call_logs(&outputs);
     assert!(
@@ -617,7 +639,7 @@ fn trunk_loop_is_refused() {
     let mut switch = switch();
     register_device(&mut world, &mut switch, "1002", "bob-secret");
     // 3001 calls 3xxx — which routes right back out the same trunk.
-    let outputs = feed_from(
+    let outputs = authenticate_peer(
         &mut world,
         &mut switch,
         &peer_invite("3001", "3002", "trunk-loop"),
@@ -641,8 +663,8 @@ fn trunk_peer_port_is_honored() {
         trunks: vec![TrunkConfig {
             name: "mikopbx".to_string(),
             peer: "192.168.77.108:5061".parse().expect("peer"),
-            username: None,
-            secret: None,
+            outbound: None,
+            inbound: None,
         }],
         ..switch_config_base()
     });
@@ -825,8 +847,11 @@ fn trunk_proxy_auth_407_is_retried() {
         trunks: vec![TrunkConfig {
             name: "mikopbx".to_string(),
             peer: peer_addr(),
-            username: Some("trunkuser".to_string()),
-            secret: Some("trunkpass".to_string()),
+            outbound: Some(TrunkAuth {
+                username: TRUNK_OUT_USER.to_string(),
+                secret: TRUNK_OUT_SECRET.to_string(),
+            }),
+            inbound: None,
         }],
         ..switch_config_base()
     });
@@ -864,8 +889,11 @@ fn trunk_auth_retry_cseq_flows_to_bye() {
         trunks: vec![TrunkConfig {
             name: "mikopbx".to_string(),
             peer: peer_addr(),
-            username: Some("trunkuser".to_string()),
-            secret: Some("trunkpass".to_string()),
+            outbound: Some(TrunkAuth {
+                username: TRUNK_OUT_USER.to_string(),
+                secret: TRUNK_OUT_SECRET.to_string(),
+            }),
+            inbound: None,
         }],
         ..switch_config_base()
     });
@@ -941,28 +969,121 @@ fn trunk_impersonation_with_port_is_blocked() {
             "From: <sip:1001@192.0.2.10:5060>;tag=far1",
         )
         .into_bytes();
-    let outputs = feed_from(&mut world, &mut switch, &forged, Some(peer_addr()));
+    let outputs = authenticate_peer(&mut world, &mut switch, &forged, Some(peer_addr()));
     assert_eq!(response_of(&outputs, 403).status, 403, "{outputs:?}");
 }
 
-/// NAT rewrites source ports: a peer is a peer by IP.
+/// Admission is by credentials, not address: an authenticated INVITE from an
+/// arbitrary host is accepted.
 #[test]
-fn trunk_nat_peer_with_different_source_port_is_admitted() {
+fn trunk_inbound_from_any_address_is_admitted_with_credentials() {
     let mut world = World::with_seed(0x5EED);
     let mut switch = switch();
     register_device(&mut world, &mut switch, "1002", "bob-secret");
-    let from: SocketAddr = "192.168.77.108:49152".parse().expect("addr");
-    let outputs = feed_from(
+    let from: SocketAddr = "10.9.9.9:49152".parse().expect("addr");
+    let outputs = authenticate_peer(
         &mut world,
         &mut switch,
-        &peer_invite("3001", "1002", "trunk-nat"),
+        &peer_invite("3001", "1002", "trunk-any-ip"),
         Some(from),
     );
     assert_eq!(
         requests_of(&outputs, Method::Invite).len(),
         1,
-        "same IP, different port: still the trunk: {outputs:?}"
+        "credentials admit the call from any address: {outputs:?}"
     );
+}
+
+/// ...and the configured peer's address alone admits nothing.
+#[test]
+fn trunk_inbound_from_configured_peer_without_credentials_is_challenged() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_device(&mut world, &mut switch, "1002", "bob-secret");
+    let outputs = feed_from(
+        &mut world,
+        &mut switch,
+        &peer_invite("3001", "1002", "trunk-peer-no-auth"),
+        Some(peer_addr()),
+    );
+    assert_eq!(response_of(&outputs, 401).status, 401, "{outputs:?}");
+    assert!(requests_of(&outputs, Method::Invite).is_empty());
+}
+
+/// A wrong password gets a fresh challenge, never a call.
+#[test]
+fn trunk_inbound_wrong_password_is_challenged() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_device(&mut world, &mut switch, "1002", "bob-secret");
+    let invite = peer_invite("3001", "1002", "trunk-wrong-pass");
+    let outputs = feed_from(&mut world, &mut switch, &invite, Some(peer_addr()));
+    let challenge = response_of(&outputs, 401);
+    let nonce = nonce_of(header_value(&challenge.headers, "WWW-Authenticate").unwrap());
+    let retry = authorized_invite(&invite, TRUNK_IN_USER, "wrong", &nonce);
+    let outputs = feed_from(&mut world, &mut switch, &retry, Some(peer_addr()));
+    assert_eq!(response_of(&outputs, 401).status, 401, "{outputs:?}");
+    assert!(requests_of(&outputs, Method::Invite).is_empty());
+}
+
+/// A username no trunk owns is forbidden, not endlessly challenged.
+#[test]
+fn trunk_inbound_unknown_username_is_forbidden() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_device(&mut world, &mut switch, "1002", "bob-secret");
+    let invite = peer_invite("3001", "1002", "trunk-unknown-user");
+    let outputs = feed_from(&mut world, &mut switch, &invite, Some(peer_addr()));
+    let challenge = response_of(&outputs, 401);
+    let nonce = nonce_of(header_value(&challenge.headers, "WWW-Authenticate").unwrap());
+    let retry = authorized_invite(&invite, "nobody", TRUNK_IN_SECRET, &nonce);
+    let outputs = feed_from(&mut world, &mut switch, &retry, Some(peer_addr()));
+    assert_eq!(response_of(&outputs, 403).status, 403, "{outputs:?}");
+    assert!(requests_of(&outputs, Method::Invite).is_empty());
+}
+
+/// Inbound and outbound credentials are separate: the credentials we use
+/// toward the peer do not authorize the peer's calls to us.
+#[test]
+fn trunk_inbound_rejects_outbound_credentials() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_device(&mut world, &mut switch, "1002", "bob-secret");
+    let invite = peer_invite("3001", "1002", "trunk-wrong-direction");
+    let outputs = feed_from(&mut world, &mut switch, &invite, Some(peer_addr()));
+    let challenge = response_of(&outputs, 401);
+    let nonce = nonce_of(header_value(&challenge.headers, "WWW-Authenticate").unwrap());
+    let retry = authorized_invite(&invite, TRUNK_OUT_USER, TRUNK_OUT_SECRET, &nonce);
+    let outputs = feed_from(&mut world, &mut switch, &retry, Some(peer_addr()));
+    assert_eq!(response_of(&outputs, 403).status, 403, "{outputs:?}");
+    assert!(requests_of(&outputs, Method::Invite).is_empty());
+}
+
+/// A nonce authorizes exactly one request: reusing it for another call is a
+/// replay and gets challenged again.
+#[test]
+fn trunk_inbound_nonce_replay_is_rejected() {
+    let mut world = World::with_seed(0x5EED);
+    let mut switch = switch();
+    register_device(&mut world, &mut switch, "1002", "bob-secret");
+    let invite = peer_invite("3001", "1002", "trunk-replay-1");
+    let outputs = feed_from(&mut world, &mut switch, &invite, Some(peer_addr()));
+    let challenge = response_of(&outputs, 401);
+    let nonce = nonce_of(header_value(&challenge.headers, "WWW-Authenticate").unwrap());
+
+    let first = authorized_invite(&invite, TRUNK_IN_USER, TRUNK_IN_SECRET, &nonce);
+    let outputs = feed_from(&mut world, &mut switch, &first, Some(peer_addr()));
+    assert_eq!(
+        requests_of(&outputs, Method::Invite).len(),
+        1,
+        "the first use is accepted"
+    );
+
+    let other = peer_invite("3001", "1002", "trunk-replay-2");
+    let second = authorized_invite(&other, TRUNK_IN_USER, TRUNK_IN_SECRET, &nonce);
+    let outputs = feed_from(&mut world, &mut switch, &second, Some(peer_addr()));
+    assert_eq!(response_of(&outputs, 401).status, 401, "{outputs:?}");
+    assert!(requests_of(&outputs, Method::Invite).is_empty());
 }
 
 /// A lost INVITE is recovered by our own retransmission timer (the DST
@@ -1057,6 +1178,70 @@ fn peer_invite(from: &str, to: &str, call_id: &str) -> Vec<u8> {
     );
     text.push_str(&String::from_utf8(body).unwrap());
     text.into_bytes()
+}
+
+/// Extracts a nonce from a `WWW-Authenticate` value.
+fn nonce_of(value: &str) -> String {
+    let start = value.find("nonce=\"").expect("nonce") + 7;
+    let end = value[start..].find('"').expect("closing quote") + start;
+    value[start..end].to_string()
+}
+
+/// Builds the authenticated retry of `invite`: new Via branch and CSeq, plus
+/// an `Authorization` answering `nonce`.
+fn authorized_invite(invite: &[u8], username: &str, secret: &str, nonce: &str) -> Vec<u8> {
+    let Message::Request(mut request) = parse_message(invite).expect("invite") else {
+        panic!("not a request");
+    };
+    let credentials = Credentials {
+        username: username.to_string(),
+        realm: REALM.to_string(),
+        nonce: nonce.to_string(),
+        uri: request.uri.clone(),
+        response: String::new(),
+        qop: None,
+        nc: None,
+        cnonce: None,
+    };
+    let response = expected_response(&credentials, secret, "INVITE");
+    let call_id = header_value(&request.headers, "call-id")
+        .expect("call-id")
+        .to_string();
+    for header in &mut request.headers {
+        match header.name.to_ascii_lowercase().as_str() {
+            "via" => {
+                header.value =
+                    format!("SIP/2.0/UDP 192.168.77.108:5060;branch=z9hG4bK-auth-{call_id}");
+            }
+            "cseq" => header.value = "2 INVITE".to_string(),
+            _ => {}
+        }
+    }
+    request.headers.push(Header {
+        name: "Authorization".to_string(),
+        value: format!(
+            "Digest username=\"{username}\", realm=\"{REALM}\", nonce=\"{nonce}\", \
+             uri=\"{}\", response=\"{response}\"",
+            request.uri
+        ),
+    });
+    serialize_message(&Message::Request(request))
+}
+
+/// Plays the peer's half of inbound authentication: sends `invite`, answers
+/// our `401` challenge, and returns the outputs of the authenticated retry.
+fn authenticate_peer(
+    world: &mut World,
+    switch: &mut Switch,
+    invite: &[u8],
+    from: Option<SocketAddr>,
+) -> Vec<Output> {
+    let outputs = feed_from(world, switch, invite, from);
+    let challenge = response_of(&outputs, 401);
+    let value = header_value(&challenge.headers, "WWW-Authenticate").expect("challenge");
+    let nonce = nonce_of(value);
+    let retry = authorized_invite(invite, TRUNK_IN_USER, TRUNK_IN_SECRET, &nonce);
+    feed_from(world, switch, &retry, from)
 }
 
 fn response_bytes(

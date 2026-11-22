@@ -215,7 +215,7 @@ fn call_logs(outputs: &[Output]) -> Vec<String> {
 }
 
 #[test]
-fn unregistered_caller_gets_403() {
+fn unregistered_caller_is_challenged() {
     let mut switch = switch();
     let outputs = switch.handle(
         Message::Request(invite("6666", "1002", "call-auth")),
@@ -223,9 +223,16 @@ fn unregistered_caller_gets_403() {
         None,
     );
     assert_eq!(
-        response_of(&outputs, 403).status,
-        403,
-        "strangers cannot dial"
+        response_of(&outputs, 401).status,
+        401,
+        "strangers must authenticate"
+    );
+    assert!(
+        response_of(&outputs, 401)
+            .headers
+            .iter()
+            .any(|header| header.name == "WWW-Authenticate"),
+        "the challenge says how"
     );
     assert_eq!(switch.active_calls(), 0);
 }

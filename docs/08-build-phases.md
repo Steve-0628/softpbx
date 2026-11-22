@@ -100,15 +100,16 @@ test; the config validator rejects nonsense rules at startup. ✅ both
 Before touching the real peer, the trunk exists in the simulation — but now
 shaped by **what MikoPBX actually does** (docs/09 §6, captured 2026-10):
 
-- `[[trunk]]` config: peer address + optional digest credentials, number
-  ranges via routing rules
+- `[[trunk]]` config: peer address + separate inbound/outbound digest
+  credentials, number ranges via routing rules
 - Outbound: routing rules that send a number range down a trunk (the phase 8
   engine already does number ranges — the target just gains "trunk X"); the
   callee leg becomes a trunk leg (its own Call-IDs, its own quirks)
-- Inbound: INVITEs from the trunk map to local devices. **Trunk legs are not
-  challenged** (source-IP matching / inbound registration) — and the simplest shape
-  has *MikoPBX register to us*, which already works against today's registrar.
-  A peer that challenges *our* INVITE gets a digest retry; a trunk caller
+- Inbound: INVITEs from the trunk map to local devices and are **challenged
+  with digest** — admission is by `[trunk.inbound]` credentials, never by
+  source address. (A peer that registers as a device instead uses the
+  registrar path, which is already authenticated.) A peer that challenges
+  *our* INVITE gets a digest retry using `[trunk.outbound]`; a trunk caller
   impersonating one of our own numbers is refused; a call that would route
   back out the trunk it arrived on is refused
 - Answer its 60 s OPTIONS probes (today's behavior — keep), keep re-REGISTER

@@ -103,7 +103,7 @@ The facts that shape the trunk work:
 | **No session timers, ever** (`timers=no`; 78 s call with zero mid-dialog traffic) | the scariest interop risk is gone; we never claim session timers at all (docs/07 §3) |
 | No UPDATE, no PRACK, no re-INVITE refresh from it | our SIP subset is closer than feared |
 | It sends **OPTIONS qualify probes every 60 s** | our OPTIONS handling is load-bearing — never break it |
-| **It challenges INVITEs** from authenticated endpoints (401 before call setup) | trunk legs are exempt (IP identify / inbound registration) — the trunk shape avoids this; a future direct-extension dial would need INVITE digest |
+| **It challenges INVITEs** from authenticated endpoints (401 before call setup) | our inbound trunk legs now challenge too, using `[trunk.inbound]`; a peer that registers as a device instead uses the registrar path |
 | Trunk modes: **outbound registration / inbound registration / static IP** | MikoPBX *registers to us* works today (verified live); no outbound REGISTER client needed for the first interop shape |
 | Digest MD5, `qop=auth` + `opaque` when it challenges; it answers challenges with or without qop | our qop-less challenge is fine (verified); its challenges need qop=auth computation when we are the client |
 | With trunk `username` set, `From`/`Contact` become the trunk login — **the real caller disappears** | use no-username/IP trunk mode (or `fromuser`/`manualattributes`) so caller identity survives; it never sends PAI on trunk legs |
@@ -119,9 +119,9 @@ unmapped number, ACKed and torn down cleanly).
 
 Admission paths, for honesty: the rows below went through MikoPBX's
 *registration-mode trunk* (it registers to us as a device) — the registrar
-path. The phase-9 `[[trunk]]`/`trunk:` paths (address-based admission,
-digest retry, loop guard) are **simulation-tested only** so far; they get
-their live rows when the reverse direction (softpbx → MikoPBX) goes up.
+path. The phase-9 `[[trunk]]`/`trunk:` paths (inbound digest admission,
+outbound digest retry, loop guard) are **simulation-tested only** so far; they
+get their live rows when the reverse direction (softpbx → MikoPBX) goes up.
 
 | Behavior | MikoPBX ↔ softpbx | Notes |
 | --- | --- | --- |

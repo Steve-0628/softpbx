@@ -27,7 +27,7 @@ use sip_syntax::{
 
 use crate::call::{transit, CallEvent, CallState, Command};
 use crate::interfaces::{interface_for, Interface};
-use crate::registration::{header, number_from_uri, Device, Registrar};
+use crate::registration::{header, number_from_uri, Device, NonceStore, Registrar};
 use crate::routing::{route, Destination, Rule};
 
 /// How long a call may go without media before we call it dead (docs/04).
@@ -36,17 +36,28 @@ pub const MEDIA_TIMEOUT_MS: u64 = 120_000;
 /// The methods we implement (docs/07); anything else gets `405` + `Allow`.
 pub const ALLOW: &str = "INVITE, ACK, BYE, CANCEL, REGISTER, OPTIONS";
 
+/// Digest credentials for one direction of a trunk (RFC 2617).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrunkAuth {
+    /// Digest username.
+    pub username: String,
+    /// Digest password.
+    pub secret: String,
+}
+
 /// A trunk to another PBX (docs/06 §1): a peer we send calls to and accept
-/// calls from. Identified by its address — no registration involved.
+/// calls from. Inbound calls authenticate with digest credentials — no
+/// registration and no IP allowlist.
 #[derive(Debug, Clone)]
 pub struct TrunkConfig {
     /// Label used in routing rules and logs ("mikopbx").
     pub name: String,
-    /// Where its SIP messages come from, and where we send ours.
+    /// Where we send our SIP messages. Never used for admission.
     pub peer: SocketAddr,
-    /// Digest credentials, for peers that challenge our INVITEs (RFC 2617).
-    pub username: Option<String>,
-    pub secret: Option<String>,
+    /// Credentials we use when the peer challenges our INVITEs.
+    pub outbound: Option<TrunkAuth>,
+    /// Credentials the peer must use when calling us.
+    pub inbound: Option<TrunkAuth>,
 }
 
 /// Everything the switch needs to know from the config file.
@@ -93,6 +104,16 @@ pub enum Output {
 enum Leg {
     Caller,
     Callee,
+}
+
+/// What an inbound INVITE's digest credentials prove.
+enum InboundAuth {
+    /// Authenticated as this trunk.
+    Authenticated(String),
+    /// No usable credentials: send a fresh challenge.
+    Challenge,
+    /// A username that no trunk owns.
+    Forbidden,
 }
 
 /// Which transaction a timer belongs to.
@@ -203,6 +224,8 @@ struct CallCtx {
 pub struct Switch {
     config: SwitchConfig,
     registrar: Registrar,
+    /// Challenges for inbound trunk calls, separate from the registrar's.
+    trunk_nonces: NonceStore,
     calls: BTreeMap<u64, CallCtx>,
     /// Both legs' Call-IDs → call.
     by_call_id: BTreeMap<String, u64>,
@@ -220,11 +243,13 @@ impl Switch {
             "a switch needs at least one local interface"
         );
         let registrar = Registrar::new(&config.realm, config.devices.clone());
+        let trunk_nonces = NonceStore::new(&config.realm);
         let free_rtp_ports =
             (config.rtp_port_base..config.rtp_port_base.saturating_add(config.rtp_ports)).collect();
         Switch {
             config,
             registrar,
+            trunk_nonces,
             calls: BTreeMap::new(),
             by_call_id: BTreeMap::new(),
             next_tag: 0,
@@ -388,8 +413,9 @@ impl Switch {
     }
 
     /// Feeds one incoming SIP message; returns what to send and log. `from` is
-    /// where the message arrived from (a trunk peer, a phone) — it decides
-    /// admission, and which local address serves that side of a new call.
+    /// where the message arrived from (a trunk peer, a phone) — it selects the
+    /// local address that serves that side of a new call. Admission is by
+    /// device registration or trunk digest credentials, never by address.
     #[must_use = "the outputs are SIP messages and call log; dispatch them"]
     pub fn handle(
         &mut self,
@@ -403,15 +429,6 @@ impl Switch {
         };
         outputs.extend(self.collect_settled(now_ms));
         outputs
-    }
-
-    /// Whether this address belongs to one of our trunk peers (by IP: the
-    /// port is where we *send*, not who they are — NAT rewrites source ports).
-    pub fn is_trunk_peer(&self, address: SocketAddr) -> bool {
-        self.config
-            .trunks
-            .iter()
-            .any(|trunk| trunk.peer.ip() == address.ip())
     }
 
     /// The local interface that serves a peer's address (docs/02 §4): the
@@ -587,17 +604,56 @@ impl Switch {
             return outputs;
         }
 
-        // Only registered devices may place calls (docs/02 §6, docs/07) —
-        // except calls from a trunk peer, which is identified by its address
-        // and does not register.
-        let from_trunk = from
-            .map(|address| self.is_trunk_peer(address))
-            .unwrap_or(false);
+        // Call admission (docs/02 §6, docs/07): a registered device may call;
+        // otherwise the caller must authenticate as a trunk with digest
+        // credentials. There is no IP allowlist — a trunk is whoever can
+        // answer our challenge.
+        let mut caller_trunk: Option<String> = None;
+        if !self.registrar.is_registered(&caller_number, now_ms) {
+            match self.authenticate_trunk(&request, now_ms) {
+                InboundAuth::Authenticated(name) => caller_trunk = Some(name),
+                InboundAuth::Challenge => {
+                    let challenge = self.trunk_nonces.challenge(now_ms);
+                    let mut response = tagged(
+                        make_response(&request, 401, "Unauthorized"),
+                        &self.fresh_tag(),
+                    );
+                    response.headers.push(Header {
+                        name: "WWW-Authenticate".to_string(),
+                        value: challenge.header_value(),
+                    });
+                    let actions = caller_tx.on_response_from_user(response, now_ms);
+                    push_sends(&mut outputs, actions);
+                    outputs.push(Output::CallLog(call_log_line(
+                        &caller_number,
+                        &dialed,
+                        now_ms,
+                        now_ms,
+                        "unauthorized",
+                    )));
+                    return outputs;
+                }
+                InboundAuth::Forbidden => {
+                    let response =
+                        tagged(make_response(&request, 403, "Forbidden"), &self.fresh_tag());
+                    let actions = caller_tx.on_response_from_user(response, now_ms);
+                    push_sends(&mut outputs, actions);
+                    outputs.push(Output::CallLog(call_log_line(
+                        &caller_number,
+                        &dialed,
+                        now_ms,
+                        now_ms,
+                        "unauthorized",
+                    )));
+                    return outputs;
+                }
+            }
+        }
         // A trunk caller may be anyone — but not *us*: an INVITE from a trunk
         // whose From claims one of our numbers in our own domain is
         // impersonation (docs/02 §6). The far side's own labels (its trunk
         // login in its own domain) are fine.
-        if from_trunk {
+        if caller_trunk.is_some() {
             // "Our own domain" is any address we serve peers from.
             let claims_our_address = host_ip(header(&request.headers, "from").unwrap_or(""))
                 .is_some_and(|address| {
@@ -625,19 +681,6 @@ impl Switch {
                 )));
                 return outputs;
             }
-        }
-        if !from_trunk && !self.registrar.is_registered(&caller_number, now_ms) {
-            let response = tagged(make_response(&request, 403, "Forbidden"), &self.fresh_tag());
-            let actions = caller_tx.on_response_from_user(response, now_ms);
-            push_sends(&mut outputs, actions);
-            outputs.push(Output::CallLog(call_log_line(
-                &caller_number,
-                &dialed,
-                now_ms,
-                now_ms,
-                "unauthorized",
-            )));
-            return outputs;
         }
 
         // Call routing (docs/03 §4): where does this number go — a device
@@ -690,15 +733,7 @@ impl Switch {
                     // Loop guard: a call that arrived *from* a trunk never
                     // goes back to the same one (overlapping number ranges
                     // between two PBXs would otherwise ping-pong forever).
-                    if from
-                        .map(|address| {
-                            self.config
-                                .trunks
-                                .iter()
-                                .any(|trunk| trunk.name == name && trunk.peer.ip() == address.ip())
-                        })
-                        .unwrap_or(false)
-                    {
+                    if caller_trunk.as_deref() == Some(name.as_str()) {
                         let response =
                             tagged(make_response(&request, 403, "Forbidden"), &self.fresh_tag());
                         let actions = caller_tx.on_response_from_user(response, now_ms);
@@ -928,6 +963,37 @@ impl Switch {
             },
         );
         outputs
+    }
+
+    /// Authenticates an INVITE from a non-registered caller as a trunk
+    /// (RFC 2617). `Challenge` means "ask again"; `Forbidden` means the
+    /// username belongs to no trunk.
+    fn authenticate_trunk(&mut self, request: &Request, now_ms: u64) -> InboundAuth {
+        let Some(value) = header(&request.headers, "authorization") else {
+            return InboundAuth::Challenge;
+        };
+        let Some(credentials) = sip_stack::digest::parse_authorization(value) else {
+            return InboundAuth::Challenge;
+        };
+        // The URI in the Authorization header is part of the hash: it must be
+        // this request's URI, not one captured from another call.
+        if credentials.uri != request.uri {
+            return InboundAuth::Challenge;
+        }
+        let Some((name, secret)) = self.config.trunks.iter().find_map(|trunk| {
+            let auth = trunk.inbound.as_ref()?;
+            (auth.username == credentials.username)
+                .then(|| (trunk.name.clone(), auth.secret.clone()))
+        }) else {
+            return InboundAuth::Forbidden;
+        };
+        if !self
+            .trunk_nonces
+            .authorize(&credentials, &secret, request, now_ms)
+        {
+            return InboundAuth::Challenge;
+        }
+        InboundAuth::Authenticated(name)
     }
 
     /// A re-INVITE inside a dialog: answer it, keeping the session as it is
@@ -1518,7 +1584,8 @@ impl Switch {
         let callee_peer = call.callee_peer;
         let (username, secret) = {
             let trunk = self.config.trunks.iter().find(|t| t.name == trunk_name)?;
-            (trunk.username.clone()?, trunk.secret.clone()?)
+            let auth = trunk.outbound.as_ref()?;
+            (auth.username.clone(), auth.secret.clone())
         };
         let challenge = sip_stack::digest::parse_challenge(challenge)?;
         // qop negotiation: we answer qop=auth, or nothing at all.

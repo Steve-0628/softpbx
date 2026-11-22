@@ -8,6 +8,13 @@ Two offices, two PBXs, one number plan: site A owns number range `2xx`,
 site B owns `3xx`. Each PBX has a "trunk" entry pointing at the other, and
 routing rules sending the other site's number range down that trunk.
 
+A trunk has two independent credential sets: `[trunk.outbound]` is what we use
+when the peer challenges our `INVITE`, and `[trunk.inbound]` is what the peer
+must use when calling us. Inbound calls are admitted by that digest challenge,
+not by the peer's address. Omitting `[trunk.inbound]` makes the trunk
+outbound-only; omitting `[trunk.outbound]` leaves our outbound calls
+unauthenticated (the peer may still accept them by its own policy).
+
 The awkward part is not the concept, it is that the other PBX (likely
 MikoPBX / Asterisk-based) will not follow the SIP standard perfectly:
 different re-INVITE timing, different caller-ID handling, quirks around session

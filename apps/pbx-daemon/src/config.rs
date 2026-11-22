@@ -37,14 +37,22 @@ pub struct FileConfig {
 pub struct TrunkCfg {
     /// Label used in `to = "trunk:<name>"` routing rules and in logs.
     pub name: String,
-    /// Its address, "ip:port".
+    /// Its address, "ip:port" — where we send our calls.
     pub peer: String,
-    /// Digest credentials, for peers that challenge our INVITEs. Both fields
-    /// or neither.
+    /// Credentials we use when the peer challenges our INVITEs.
     #[serde(default)]
-    pub username: Option<String>,
+    pub outbound: Option<TrunkAuthCfg>,
+    /// Credentials the peer must use when calling us.
     #[serde(default)]
-    pub secret: Option<String>,
+    pub inbound: Option<TrunkAuthCfg>,
+}
+
+/// One direction's digest credentials: both fields are required.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrunkAuthCfg {
+    pub username: String,
+    pub secret: String,
 }
 
 /// One `[[routing]]` rule: `match` a dialed number, `to` a destination.
@@ -240,6 +248,7 @@ impl FileConfig {
             }
         }
         let mut trunks = HashSet::new();
+        let mut inbound_usernames = HashSet::new();
         for trunk in &self.trunk {
             if trunk.name.is_empty() {
                 bail!("a [[trunk]] has an empty name");
@@ -251,8 +260,28 @@ impl FileConfig {
                 .peer
                 .parse::<std::net::SocketAddr>()
                 .with_context(|| format!("trunk \"{}\": peer must be ip:port", trunk.name))?;
-            if trunk.username.is_some() != trunk.secret.is_some() {
-                bail!("trunk \"{}\": username and secret go together", trunk.name);
+            if let Some(auth) = &trunk.outbound {
+                if auth.username.is_empty() {
+                    bail!("trunk \"{}\": outbound username is empty", trunk.name);
+                }
+                if auth.secret.is_empty() {
+                    bail!("trunk \"{}\": outbound secret is empty", trunk.name);
+                }
+            }
+            if let Some(auth) = &trunk.inbound {
+                if auth.username.is_empty() {
+                    bail!("trunk \"{}\": inbound username is empty", trunk.name);
+                }
+                if auth.secret.is_empty() {
+                    bail!("trunk \"{}\": inbound secret is empty", trunk.name);
+                }
+                if !inbound_usernames.insert(auth.username.clone()) {
+                    bail!(
+                        "trunk \"{}\": duplicate inbound username \"{}\"",
+                        trunk.name,
+                        auth.username
+                    );
+                }
             }
         }
         let mut numbers = HashSet::new();
@@ -296,8 +325,14 @@ impl FileConfig {
                 .map(|trunk| call::TrunkConfig {
                     name: trunk.name.clone(),
                     peer: trunk.peer.parse().expect("validated"),
-                    username: trunk.username.clone(),
-                    secret: trunk.secret.clone(),
+                    outbound: trunk.outbound.as_ref().map(|auth| call::TrunkAuth {
+                        username: auth.username.clone(),
+                        secret: auth.secret.clone(),
+                    }),
+                    inbound: trunk.inbound.as_ref().map(|auth| call::TrunkAuth {
+                        username: auth.username.clone(),
+                        secret: auth.secret.clone(),
+                    }),
                 })
                 .collect(),
             devices: self
@@ -453,11 +488,16 @@ mod tests {
     fn trunk_rules_validate() {
         let good = format!(
             "{GOOD}\n[[trunk]]\nname = \"mikopbx\"\npeer = \"192.168.77.108:5060\"\n\n\
+             [trunk.outbound]\nusername = \"ou\"\nsecret = \"os\"\n\n\
+             [trunk.inbound]\nusername = \"iu\"\nsecret = \"is\"\n\n\
              [[routing]]\nmatch = \"3*\"\nto = \"trunk:mikopbx\"\n"
         );
         let config = FileConfig::parse(&good).expect("valid trunk");
         assert_eq!(config.trunk.len(), 1);
-        assert_eq!(config.switch_config().trunks.len(), 1);
+        let switch = config.switch_config();
+        assert_eq!(switch.trunks.len(), 1);
+        assert_eq!(switch.trunks[0].outbound.as_ref().unwrap().username, "ou");
+        assert_eq!(switch.trunks[0].inbound.as_ref().unwrap().username, "iu");
 
         // A route to a trunk that does not exist is refused at startup.
         let dangling = format!("{GOOD}\n[[routing]]\nmatch = \"3*\"\nto = \"trunk:nope\"\n");
@@ -467,6 +507,36 @@ mod tests {
         // A trunk needs a real address.
         let bad_peer = format!("{GOOD}\n[[trunk]]\nname = \"m\"\npeer = \"over-there:5060\"\n");
         assert!(FileConfig::parse(&bad_peer).is_err());
+
+        // Credentials are required per direction, and inbound usernames are
+        // unique across trunks.
+        let empty_secret = format!(
+            "{GOOD}\n[[trunk]]\nname = \"m\"\npeer = \"192.168.77.1:5060\"\n\
+             [trunk.inbound]\nusername = \"u\"\nsecret = \"\"\n"
+        );
+        let error = FileConfig::parse(&empty_secret).expect_err("empty secret");
+        assert!(format!("{error:#}").contains("secret"), "{error:#}");
+
+        let duplicate = format!(
+            "{GOOD}\n[[trunk]]\nname = \"a\"\npeer = \"192.168.77.1:5060\"\n\
+             [trunk.inbound]\nusername = \"same\"\nsecret = \"x\"\n\n\
+             [[trunk]]\nname = \"b\"\npeer = \"192.168.77.2:5060\"\n\
+             [trunk.inbound]\nusername = \"same\"\nsecret = \"y\"\n"
+        );
+        let error = FileConfig::parse(&duplicate).expect_err("duplicate inbound username");
+        assert!(
+            format!("{error:#}").contains("duplicate inbound username"),
+            "{error:#}"
+        );
+
+        // The old flat fields are gone: a config that still uses them fails
+        // instead of silently losing its credentials.
+        let old = format!(
+            "{GOOD}\n[[trunk]]\nname = \"m\"\npeer = \"192.168.77.1:5060\"\n\
+             username = \"u\"\nsecret = \"s\"\n"
+        );
+        let error = FileConfig::parse(&old).expect_err("old trunk fields");
+        assert!(format!("{error:#}").contains("unknown field"), "{error:#}");
     }
 
     #[test]

@@ -112,9 +112,15 @@ to = "trunk:mikopbx"
 
 [[trunk]]
 name = "mikopbx"                # the peer routes the number itself
-peer = "192.168.77.108:5060"
-# username = "trunkuser"        # digest credentials, for peers that
-# secret = "trunkpass"          # challenge our INVITEs (both or neither)
+peer = "192.168.77.108:5060"    # where we send; never used for admission
+
+# [trunk.outbound]              # we answer the peer's challenges with these
+# username = "trunkuser"
+# secret = "trunkpass"
+
+# [trunk.inbound]               # the peer must answer our challenge with these
+# username = "softpbx-in"
+# secret = "change-me"
 ```
 
 A PBX on several networks gets one `[[interface]]` per network. Each peer is
@@ -148,8 +154,10 @@ The system runs on a trusted office network or VPN. What we still do:
 
 - Digest authentication for phone registrations: without the right password a
   device cannot register. Call admission then requires a live registration —
-  or being a configured trunk peer (trunk peers are identified by address and
-  do not register).
+  or answering a digest challenge with a configured trunk's inbound
+  credentials. Trunk admission is never by address: inbound and outbound
+  credentials are separate, and a trunk with no inbound credentials accepts no
+  inbound calls.
 - Clear refusal of malformed or oversized SIP messages (no panics, no unbounded
   memory growth).
 - No remote management surface at all, which is the simplest possible attack

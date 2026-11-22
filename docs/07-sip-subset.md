@@ -57,11 +57,13 @@ for now: hold and transfer are not in the first phase, docs/01.)
 - Digest authentication (MD5, with and without `qop`): `REGISTER` is
   challenged, wrong password → `401`, unknown number → `403`. Only nonces we
   issued verify within a five-minute window, so a sniffed response cannot be replayed.
-- **Only registered devices may place calls** — and trunk peers, which are
-  identified by their address and do not register: an `INVITE` whose caller
-  has no live binding gets `403`, unless it comes from a configured trunk
-  (whose callers may be anyone except *our own* numbers in our domain —
-  impersonation gets `403` too).
+- **Only registered devices may place calls** — and trunk peers, which do not
+  register but answer a digest challenge: an `INVITE` whose caller has no live
+  binding is challenged with `401`; valid inbound trunk credentials admit it,
+  and an unknown trunk username gets `403`. Admission is never by source
+  address, and inbound/outbound trunk credentials are separate. A trunk
+  caller may be anyone except *our own* numbers in our domain — impersonation
+  gets `403` too.
 
 ### NAT hygiene
 - `rport` / `received` (RFC 3581) processing is not implemented — instead,

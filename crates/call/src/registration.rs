@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use sip_stack::digest::{self, Challenge};
+use sip_stack::digest::{self, Challenge, Credentials};
 use sip_stack::{make_response, uri_of};
 use sip_syntax::{Header, Request, Response};
 
@@ -43,12 +43,7 @@ pub struct Registrar {
     realm: String,
     devices: HashMap<String, Device>,
     bindings: HashMap<String, Binding>,
-    nonce_counter: u64,
-    /// Nonces we handed out; only those verify (replay protection).
-    issued_nonces: VecDeque<String>,
-    /// The request each nonce has already authorized: one nonce, one request
-    /// (replay protection). Its retransmissions are the only reuse allowed.
-    used_nonces: VecDeque<(String, Request)>,
+    nonces: NonceStore,
 }
 
 /// How many outstanding nonces to remember (plenty for a small office).
@@ -79,9 +74,7 @@ impl Registrar {
                 .map(|device| (device.number.clone(), device))
                 .collect(),
             bindings: HashMap::new(),
-            nonce_counter: 0,
-            issued_nonces: VecDeque::new(),
-            used_nonces: VecDeque::new(),
+            nonces: NonceStore::new(realm),
         }
     }
 
@@ -99,10 +92,7 @@ impl Registrar {
         };
 
         if !self.is_authorized(request, &device, now_ms) {
-            let challenge = Challenge {
-                realm: self.realm.clone(),
-                nonce: self.next_nonce(now_ms),
-            };
+            let challenge = self.nonces.challenge(now_ms);
             let mut response = make_response(request, 401, "Unauthorized");
             response.headers.push(Header {
                 name: "WWW-Authenticate".to_string(),
@@ -197,18 +187,65 @@ impl Registrar {
         let Some(credentials) = digest::parse_authorization(value) else {
             return false;
         };
+        if credentials.username != device.number {
+            return false;
+        }
+        self.nonces
+            .authorize(&credentials, &device.secret, request, now_ms)
+    }
+}
+
+/// Nonces we issued, and the request each one authorized (RFC 2617 replay
+/// protection). The registrar and trunk authentication each own one: only
+/// nonces we handed out verify, and a nonce authorizes exactly one request —
+/// its retransmissions are the only reuse allowed.
+#[derive(Debug)]
+pub(crate) struct NonceStore {
+    realm: String,
+    counter: u64,
+    /// Nonces we handed out; only those verify.
+    issued: VecDeque<String>,
+    /// The request each nonce has already authorized.
+    used: VecDeque<(String, Request)>,
+}
+
+impl NonceStore {
+    pub(crate) fn new(realm: &str) -> Self {
+        NonceStore {
+            realm: realm.to_string(),
+            counter: 0,
+            issued: VecDeque::new(),
+            used: VecDeque::new(),
+        }
+    }
+
+    /// A fresh challenge for this store's realm.
+    pub(crate) fn challenge(&mut self, now_ms: u64) -> Challenge {
+        Challenge {
+            realm: self.realm.clone(),
+            nonce: self.next_nonce(now_ms),
+        }
+    }
+
+    /// Whether `credentials` answer a challenge we issued for this exact
+    /// request. The caller checks the username.
+    pub(crate) fn authorize(
+        &mut self,
+        credentials: &Credentials,
+        secret: &str,
+        request: &Request,
+        now_ms: u64,
+    ) -> bool {
         // Only nonces we issued, and only recently: a sniffed response cannot
         // be replayed to rebind someone else's number.
         if !self
-            .issued_nonces
+            .issued
             .iter()
             .any(|nonce| nonce == &credentials.nonce && nonce_fresh(nonce, now_ms))
         {
             return false;
         }
-        if credentials.username != device.number
-            || !digest::verify(&credentials, &device.secret, request.method.as_str())
-        {
+        if !digest::verify(credentials, secret, request.method.as_str()) {
             return false;
         }
         // A captured Authorization is not a password: it may authorize only
@@ -221,24 +258,23 @@ impl Registrar {
     /// Marks `nonce` as used by `request`, reporting whether this use is the
     /// request that owns the nonce (`true`) or a replay (`false`).
     fn consume_nonce(&mut self, nonce: &str, request: &Request) -> bool {
-        if let Some((_, owner)) = self.used_nonces.iter().find(|(used, _)| used == nonce) {
+        if let Some((_, owner)) = self.used.iter().find(|(used, _)| used == nonce) {
             return owner == request;
         }
-        if self.used_nonces.len() >= MAX_NONCES {
-            self.used_nonces.pop_front();
+        if self.used.len() >= MAX_NONCES {
+            self.used.pop_front();
         }
-        self.used_nonces
-            .push_back((nonce.to_string(), request.clone()));
+        self.used.push_back((nonce.to_string(), request.clone()));
         true
     }
 
     fn next_nonce(&mut self, now_ms: u64) -> String {
-        self.nonce_counter += 1;
-        let nonce = format!("{now_ms:x}-{:x}", self.nonce_counter);
-        if self.issued_nonces.len() >= MAX_NONCES {
-            self.issued_nonces.pop_front();
+        self.counter += 1;
+        let nonce = format!("{now_ms:x}-{:x}", self.counter);
+        if self.issued.len() >= MAX_NONCES {
+            self.issued.pop_front();
         }
-        self.issued_nonces.push_back(nonce.clone());
+        self.issued.push_back(nonce.clone());
         nonce
     }
 }
