@@ -20,7 +20,7 @@ tables).
 | --- | --- |
 | INVITE / ACK / BYE | making and ending calls — the product |
 | CANCEL | cancelling a call that is still ringing |
-| REGISTER | phones announcing where they are |
+| REGISTER | phones and incoming trunks announcing contacts; outbound trunk registration and refresh |
 | OPTIONS | capability probes and NAT keepalive; phones send these constantly |
 
 Any other method: `405 Method Not Allowed` with an `Allow` header. This is the
@@ -57,13 +57,16 @@ for now: hold and transfer are not in the first phase, docs/01.)
 - Digest authentication (MD5, with and without `qop`): `REGISTER` is
   challenged, wrong password → `401`, unknown number → `403`. Only nonces we
   issued verify within a five-minute window, so a sniffed response cannot be replayed.
-- **Only registered devices may place calls** — and trunk peers, which do not
-  register but answer a digest challenge: an `INVITE` whose caller has no live
+- **Only registered devices may place calls** — and trunk peers, which
+  answer a digest challenge independently of their registration mode: an `INVITE` whose caller has no live
   binding is challenged with `401`; valid inbound trunk credentials admit it,
   and an unknown trunk username gets `403`. Admission is never by source
   address, and inbound/outbound trunk credentials are separate. A trunk
   caller may be anyone except *our own* numbers in our domain — impersonation
   gets `403` too.
+
+Trunk registration modes, expiry negotiation, refresh/retry behavior, and the
+one-contact subset are documented in [SIP trunks](10-sip-trunks.md).
 
 ### NAT hygiene
 - `rport` / `received` (RFC 3581) processing is not implemented — instead,

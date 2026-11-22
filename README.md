@@ -19,6 +19,7 @@ Design stance: **small, understandable, and honest about what it is not.**
 | --- | --- |
 | Devices | Phones register with a number and a password |
 | Calls | Calls between devices with G.711 audio |
+| SIP trunks | Static digest and incoming/outgoing REGISTER; [MikoPBX setup](docs/10-sip-trunks.md) |
 | Call routing | Rules for where a dialed number goes: wildcards, rewriting (`strip`), refusal, fixed destinations (docs/03 §4) |
 
 ## What it does not do
@@ -29,8 +30,7 @@ management APIs, provisioning of phones or gateways, TLS/SRTP, clustering or
 hot failover.
 
 Later (not in the first phase): hold/transfer, ring groups (ring several phones
-at once, first to answer wins), a SIP trunk to a remote MikoPBX-compatible PBX,
-and fax / dial-up modem traffic. The design keeps room for all of these — see
+at once, first to answer wins), and fax / dial-up modem traffic. The design keeps room for all of these — see
 [docs/06-later.md](docs/06-later.md) — but the first phase is just calls.
 
 Analog phones, fax machines and modems can be reached through an external
@@ -77,7 +77,8 @@ A minimal config file is described in [docs/02-architecture.md](docs/02-architec
 | [docs/03-calls.md](docs/03-calls.md) | How a call works, in plain terms |
 | [docs/04-testing.md](docs/04-testing.md) | Test strategy and the simulation test bed |
 | [docs/05-roadmap.md](docs/05-roadmap.md) | Order of work and exit criteria |
-| [docs/06-later.md](docs/06-later.md) | Future work: trunk, analog gateways, fax, modems |
+| [docs/06-later.md](docs/06-later.md) | Analog gateways, fax, modems |
+| [docs/10-sip-trunks.md](docs/10-sip-trunks.md) | SIP trunk registration and MikoPBX configuration |
 | [docs/07-sip-subset.md](docs/07-sip-subset.md) | Exactly which parts of SIP we implement (and which we don't) |
 | [docs/08-build-phases.md](docs/08-build-phases.md) | How the code gets built, phase by phase |
 | [docs/09-softphone-testing.md](docs/09-softphone-testing.md) | Real-phone testing notes and interop findings |

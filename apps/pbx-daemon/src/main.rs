@@ -307,7 +307,17 @@ async fn main() -> anyhow::Result<()> {
 
     let device_count = config.device.len();
     let pbx = Arc::new(Pbx {
-        switch: Mutex::new(Switch::new(config.switch_config())),
+        switch: Mutex::new(Switch::with_instance_id(
+            config.switch_config(),
+            &format!(
+                "{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ),
+        )),
         started: Instant::now(),
         interfaces,
         sip,

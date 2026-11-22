@@ -9,6 +9,8 @@ mod interfaces;
 mod registration;
 mod routing;
 mod switch;
+mod trunk_registration;
+pub use trunk_registration::TrunkRegistration;
 
 pub use call::{transit, CallEvent, CallState, Command};
 pub use interfaces::{interface_for, Interface, Network};

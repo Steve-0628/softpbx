@@ -76,6 +76,9 @@ pub fn parse_challenge(value: &str) -> Option<DigestChallenge> {
             .find(|(key, _)| key == name)
             .map(|(_, field_value)| field_value.clone())
     };
+    if get("algorithm").is_some_and(|a| !a.eq_ignore_ascii_case("MD5")) {
+        return None;
+    }
     Some(DigestChallenge {
         realm: get("realm")?,
         nonce: get("nonce")?,
@@ -93,6 +96,19 @@ pub fn authorization_value(
     method: &str,
     uri: &str,
 ) -> String {
+    authorization_value_with_cnonce(challenge, username, password, method, uri, "softpbx")
+}
+
+/// Answers a challenge with a caller-supplied fresh client nonce. Each new
+/// cnonce starts its own nonce-count at one, even if a server reuses its nonce.
+pub fn authorization_value_with_cnonce(
+    challenge: &DigestChallenge,
+    username: &str,
+    password: &str,
+    method: &str,
+    uri: &str,
+    cnonce: &str,
+) -> String {
     let qop_auth = challenge
         .qop
         .as_deref()
@@ -106,7 +122,7 @@ pub fn authorization_value(
         response: String::new(),
         qop: qop_auth.then(|| "auth".to_string()),
         nc: qop_auth.then(|| "00000001".to_string()),
-        cnonce: qop_auth.then(|| "softpbx".to_string()),
+        cnonce: qop_auth.then(|| cnonce.to_string()),
     };
     let response = expected_response(&credentials, password, method);
     let mut value = format!(
@@ -114,7 +130,7 @@ pub fn authorization_value(
         username, challenge.realm, challenge.nonce, uri, response
     );
     if qop_auth {
-        value.push_str(", qop=auth, nc=00000001, cnonce=\"softpbx\"");
+        value.push_str(&format!(", qop=auth, nc=00000001, cnonce=\"{cnonce}\""));
     }
     if let Some(opaque) = &challenge.opaque {
         value.push_str(&format!(", opaque=\"{opaque}\""));

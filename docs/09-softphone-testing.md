@@ -92,7 +92,12 @@ reviewers instead.
 - a hardphone when one is available (twinkle ✅ done — see §4)
 - the reverse direction (softpbx → MikoPBX) and the rest of the matrix
 
-## 6. MikoPBX (the trunk peer) — what it actually is
+## 6. MikoPBX (the trunk peer) — historical live observations
+
+The results below predate trunk-level REGISTER support. For the current
+incoming/outgoing provider setup, use [SIP trunks and MikoPBX](10-sip-trunks.md).
+The device-account and static-trunk workarounds below are historical, not the
+current configuration procedure.
 
 Captured 2026-10 against MikoPBX 2026.3.40 (Asterisk 22.8.2 / chan_pjsip).
 Full evidence and verbatim messages: [reference/mikopbx-2026.3.md](reference/mikopbx-2026.3.md).

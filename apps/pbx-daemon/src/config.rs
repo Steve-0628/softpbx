@@ -38,13 +38,34 @@ pub struct TrunkCfg {
     /// Label used in `to = "trunk:<name>"` routing rules and in logs.
     pub name: String,
     /// Its address, "ip:port" — where we send our calls.
-    pub peer: String,
-    /// Credentials we use when the peer challenges our INVITEs.
+    #[serde(default)]
+    pub peer: Option<String>,
+    /// "none" (legacy static trunk), "incoming", or "outgoing".
+    #[serde(default)]
+    pub registration: RegistrationMode,
+    /// Requested outbound registration lifetime, in seconds.
+    #[serde(default = "registration_expires")]
+    pub expires: u64,
+    /// Credentials we use when the peer challenges REGISTER or INVITE.
     #[serde(default)]
     pub outbound: Option<TrunkAuthCfg>,
-    /// Credentials the peer must use when calling us.
+    /// Credentials the peer must use for incoming REGISTER and INVITE.
     #[serde(default)]
     pub inbound: Option<TrunkAuthCfg>,
+}
+
+/// Registration direction, independent of INVITE credentials.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RegistrationMode {
+    #[default]
+    None,
+    Incoming,
+    Outgoing,
+}
+
+fn registration_expires() -> u64 {
+    3600
 }
 
 /// One direction's digest credentials: both fields are required.
@@ -256,10 +277,40 @@ impl FileConfig {
             if !trunks.insert(trunk.name.clone()) {
                 bail!("duplicate trunk name \"{}\"", trunk.name);
             }
-            trunk
-                .peer
-                .parse::<std::net::SocketAddr>()
-                .with_context(|| format!("trunk \"{}\": peer must be ip:port", trunk.name))?;
+            if let Some(peer) = &trunk.peer {
+                let peer = peer
+                    .parse::<SocketAddr>()
+                    .with_context(|| format!("trunk \"{}\": peer must be ip:port", trunk.name))?;
+                if trunk.registration != RegistrationMode::None
+                    && (peer.ip().is_unspecified() || peer.port() == 0)
+                {
+                    bail!("trunk peer must be reachable");
+                }
+            } else if trunk.registration != RegistrationMode::Incoming {
+                bail!(
+                    "trunk \"{}\": peer is required for static/outgoing trunks",
+                    trunk.name
+                );
+            }
+            if trunk.registration == RegistrationMode::Incoming && trunk.inbound.is_none() {
+                bail!("incoming registration requires inbound credentials");
+            }
+            if trunk.registration == RegistrationMode::Incoming
+                && trunk
+                    .inbound
+                    .as_ref()
+                    .is_some_and(|auth| self.device.iter().any(|d| d.number == auth.username))
+            {
+                bail!("incoming trunk and device usernames must be distinct");
+            }
+            if trunk.registration == RegistrationMode::Outgoing && trunk.outbound.is_none() {
+                bail!("outgoing registration requires outbound credentials");
+            }
+            if trunk.registration == RegistrationMode::Outgoing
+                && !(60..=86400).contains(&trunk.expires)
+            {
+                bail!("trunk expires must be 60..86400 seconds");
+            }
             if let Some(auth) = &trunk.outbound {
                 if auth.username.is_empty() {
                     bail!("trunk \"{}\": outbound username is empty", trunk.name);
@@ -324,7 +375,17 @@ impl FileConfig {
                 .iter()
                 .map(|trunk| call::TrunkConfig {
                     name: trunk.name.clone(),
-                    peer: trunk.peer.parse().expect("validated"),
+                    peer: trunk
+                        .peer
+                        .as_ref()
+                        .map(|peer| peer.parse().expect("validated")),
+                    registration: match trunk.registration {
+                        RegistrationMode::None => call::TrunkRegistration::None,
+                        RegistrationMode::Incoming => call::TrunkRegistration::Incoming,
+                        RegistrationMode::Outgoing => call::TrunkRegistration::Outgoing {
+                            expires_s: trunk.expires,
+                        },
+                    },
                     outbound: trunk.outbound.as_ref().map(|auth| call::TrunkAuth {
                         username: auth.username.clone(),
                         secret: auth.secret.clone(),
@@ -545,5 +606,50 @@ mod tests {
         let typo = GOOD.replace("name = \"Alice\"", "name = \"Alice\"\npin = \"1234\"");
         let error = FileConfig::parse(&typo).expect_err("unknown device key");
         assert!(format!("{error:#}").contains("pin"), "{error:#}");
+    }
+    #[test]
+    fn registration_mode_configuration() {
+        let incoming = r#"
+            [[trunk]]
+            name = "from-miko"
+            registration = "incoming"
+            [trunk.inbound]
+            username = "SIP-TRUNK-local"
+            secret = "secret"
+        "#;
+        let parsed = FileConfig::parse(&format!("{GOOD}\n{incoming}")).unwrap();
+        assert!(parsed.switch_config().trunks[0].peer.is_none());
+        assert_eq!(
+            parsed.switch_config().trunks[0].registration,
+            call::TrunkRegistration::Incoming
+        );
+        let outgoing = r#"
+            [[trunk]]
+            name = "to-miko"
+            peer = "192.0.2.20:5060"
+            registration = "outgoing"
+            expires = 120
+            [trunk.outbound]
+            username = "SIP-TRUNK-remote"
+            secret = "secret"
+        "#;
+        let parsed = FileConfig::parse(&format!("{GOOD}\n{outgoing}")).unwrap();
+        assert_eq!(
+            parsed.switch_config().trunks[0].registration,
+            call::TrunkRegistration::Outgoing { expires_s: 120 }
+        );
+        for invalid in [
+            outgoing.replace("outbound", "inbound"),
+            outgoing.replace("120", "0"),
+            outgoing.replace("192.0.2.20:5060", "0.0.0.0:0"),
+            incoming.replace("inbound", "outbound"),
+            incoming.replace("SIP-TRUNK-local", "1001"),
+            incoming.replace("incoming", "typo"),
+        ] {
+            assert!(
+                FileConfig::parse(&format!("{GOOD}\n{invalid}")).is_err(),
+                "{invalid}"
+            );
+        }
     }
 }

@@ -29,6 +29,7 @@ use crate::call::{transit, CallEvent, CallState, Command};
 use crate::interfaces::{interface_for, Interface};
 use crate::registration::{header, number_from_uri, Device, NonceStore, Registrar};
 use crate::routing::{route, Destination, Rule};
+use crate::trunk_registration::{IncomingRegistrations, OutboundRegistration, TrunkRegistration};
 
 /// How long a call may go without media before we call it dead (docs/04).
 pub const MEDIA_TIMEOUT_MS: u64 = 120_000;
@@ -46,17 +47,20 @@ pub struct TrunkAuth {
 }
 
 /// A trunk to another PBX (docs/06 §1): a peer we send calls to and accept
-/// calls from. Inbound calls authenticate with digest credentials — no
-/// registration and no IP allowlist.
+/// calls from. Calls authenticate with digest credentials. Registration
+/// provides peer discovery independently of call authentication.
 #[derive(Debug, Clone)]
 pub struct TrunkConfig {
     /// Label used in routing rules and logs ("mikopbx").
     pub name: String,
-    /// Where we send our SIP messages. Never used for admission.
-    pub peer: SocketAddr,
-    /// Credentials we use when the peer challenges our INVITEs.
+    /// Static/registrar address; optional for incoming registration.
+    /// Never used for call admission.
+    pub peer: Option<SocketAddr>,
+    /// Registration role; None preserves static digest trunks.
+    pub registration: TrunkRegistration,
+    /// Credentials we use when the peer challenges REGISTER or INVITE.
     pub outbound: Option<TrunkAuth>,
-    /// Credentials the peer must use when calling us.
+    /// Credentials the peer must use for incoming REGISTER and INVITE.
     pub inbound: Option<TrunkAuth>,
 }
 
@@ -226,6 +230,8 @@ pub struct Switch {
     registrar: Registrar,
     /// Challenges for inbound trunk calls, separate from the registrar's.
     trunk_nonces: NonceStore,
+    trunk_registrar: IncomingRegistrations,
+    outbound_registrations: Vec<OutboundRegistration>,
     calls: BTreeMap<u64, CallCtx>,
     /// Both legs' Call-IDs → call.
     by_call_id: BTreeMap<String, u64>,
@@ -238,18 +244,57 @@ pub struct Switch {
 impl Switch {
     /// Creates a switch for the given devices and addresses.
     pub fn new(config: SwitchConfig) -> Self {
+        Self::with_instance_id(config, "simulation")
+    }
+
+    /// Supplies a fresh process identity for outbound REGISTER Call-IDs.
+    /// The daemon supplies this from its clock; simulations use a fixed ID.
+    pub fn with_instance_id(config: SwitchConfig, instance_id: &str) -> Self {
         assert!(
             !config.interfaces.is_empty(),
             "a switch needs at least one local interface"
         );
         let registrar = Registrar::new(&config.realm, config.devices.clone());
         let trunk_nonces = NonceStore::new(&config.realm);
+        let trunk_registrar = IncomingRegistrations::new(
+            &config.realm,
+            config
+                .trunks
+                .iter()
+                .filter(|t| t.registration == TrunkRegistration::Incoming)
+                .filter_map(|t| t.inbound.clone())
+                .collect(),
+        );
+        let outbound_registrations = config
+            .trunks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, trunk)| {
+                let TrunkRegistration::Outgoing { expires_s } = trunk.registration else {
+                    return None;
+                };
+                let peer = trunk.peer?;
+                let local = interface_for(&config.interfaces, peer.ip())
+                    .unwrap_or(&config.interfaces[0])
+                    .sip;
+                Some(OutboundRegistration::new(
+                    trunk.name.clone(),
+                    peer,
+                    local,
+                    trunk.outbound.clone()?,
+                    expires_s,
+                    format!("softpbx-register-{index}-{instance_id}"),
+                ))
+            })
+            .collect();
         let free_rtp_ports =
             (config.rtp_port_base..config.rtp_port_base.saturating_add(config.rtp_ports)).collect();
         Switch {
             config,
             registrar,
             trunk_nonces,
+            trunk_registrar,
+            outbound_registrations,
             calls: BTreeMap::new(),
             by_call_id: BTreeMap::new(),
             next_tag: 0,
@@ -262,6 +307,7 @@ impl Switch {
     /// Drops expired registrations (call occasionally; cheap).
     pub fn expire(&mut self, now_ms: u64) {
         self.registrar.expire(now_ms);
+        self.trunk_registrar.expire(now_ms);
     }
 
     /// Tears down calls whose media went silent: endpoints that die without a
@@ -297,6 +343,20 @@ impl Switch {
     /// How many media ports are still free (leak checks in tests).
     pub fn free_media_ports(&self) -> usize {
         self.free_rtp_ports.len()
+    }
+
+    /// Whether this trunk has a live incoming or outgoing registration.
+    pub fn trunk_registered(&self, name: &str, now_ms: u64) -> bool {
+        self.outbound_registrations
+            .iter()
+            .any(|r| r.name == name && r.registered(now_ms))
+            || self.config.trunks.iter().any(|t| {
+                t.name == name
+                    && t.registration == TrunkRegistration::Incoming
+                    && t.inbound
+                        .as_ref()
+                        .is_some_and(|a| self.trunk_registrar.is_registered(&a.username, now_ms))
+            })
     }
 
     /// Currently registered numbers.
@@ -346,6 +406,7 @@ impl Switch {
                 collect(TxSlot::Client(index), tx.next_timer());
             }
         }
+        timers.extend(self.outbound_registrations.iter().map(|r| r.timer()));
         timers.sort();
         timers
     }
@@ -353,6 +414,13 @@ impl Switch {
     /// A timer armed from [`Switch::timers`] fired.
     #[must_use = "the outputs are SIP messages; dispatch them"]
     pub fn on_timer(&mut self, name: &str, now_ms: u64) -> Vec<Output> {
+        if let Some(registration) = self
+            .outbound_registrations
+            .iter_mut()
+            .find(|r| r.timer().0 == name)
+        {
+            return registration.on_timer(now_ms);
+        }
         let Some((id, slot, timer)) = parse_timer_name(name) else {
             return vec![];
         };
@@ -478,7 +546,18 @@ impl Switch {
         }
         match request.method {
             Method::Register => {
-                let response = self.registrar.handle_register(&request, now_ms);
+                let number = crate::registration::number_from_request(&request);
+                let is_trunk = self.config.trunks.iter().any(|t| {
+                    t.registration == TrunkRegistration::Incoming
+                        && t.inbound
+                            .as_ref()
+                            .is_some_and(|a| Some(&a.username) == number.as_ref())
+                });
+                let response = if is_trunk {
+                    self.trunk_registrar.handle_register(&request, now_ms)
+                } else {
+                    self.registrar.handle_register(&request, now_ms)
+                };
                 vec![Output::Send(Message::Response(response))]
             }
             Method::Options => {
@@ -764,12 +843,47 @@ impl Switch {
                         )));
                         return outputs;
                     };
+                    let contact = if trunk.registration == TrunkRegistration::Incoming {
+                        trunk
+                            .inbound
+                            .as_ref()
+                            .and_then(|auth| self.trunk_registrar.lookup(&auth.username, now_ms))
+                            .map(|contact| {
+                                // A trunk routes the dialed DID, not the REGISTER username.
+                                let host = contact
+                                    .strip_prefix("sip:")
+                                    .unwrap_or(contact)
+                                    .rsplit('@')
+                                    .next()
+                                    .unwrap_or(contact);
+                                format!("sip:{number}@{host}")
+                            })
+                    } else {
+                        trunk.peer.map(|peer| format!("sip:{number}@{peer}"))
+                    };
+                    let Some(contact) = contact else {
+                        let response = tagged(
+                            make_response(&request, 480, "Temporarily Unavailable"),
+                            &self.fresh_tag(),
+                        );
+                        push_sends(
+                            &mut outputs,
+                            caller_tx.on_response_from_user(response, now_ms),
+                        );
+                        outputs.push(Output::CallLog(call_log_line(
+                            &caller_number,
+                            &number,
+                            now_ms,
+                            now_ms,
+                            "trunk-unavailable",
+                        )));
+                        return outputs;
+                    };
                     callee_trunk = Some(trunk.name.clone());
-                    (
-                        number.clone(),
-                        format!("sip:{number}@{}", trunk.peer),
-                        trunk.peer.ip().to_string(),
-                    )
+                    let domain = host_ip(&contact)
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_default();
+                    (number.clone(), contact, domain)
                 }
             };
 
@@ -1147,6 +1261,13 @@ impl Switch {
     // ----- in-dialog traffic ----------------------------------------------
 
     fn handle_response(&mut self, response: Response, now_ms: u64) -> Vec<Output> {
+        if let Some(registration) = self
+            .outbound_registrations
+            .iter_mut()
+            .find(|r| r.matches(&response))
+        {
+            return registration.response(response, now_ms);
+        }
         // Responses to our own BYE/CANCEL transactions complete those
         // transactions — they drive no call events.
         let client_hit = self.calls.iter().find_map(|(id, call)| {

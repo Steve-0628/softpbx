@@ -115,3 +115,15 @@ fn challenge_header_value() {
         "Digest realm=\"softpbx\", nonce=\"abc123\", algorithm=MD5"
     );
 }
+
+#[test]
+fn unsupported_digest_algorithm_is_not_silently_answered_as_md5() {
+    assert!(sip_stack::digest::parse_challenge(
+        "Digest realm=\"pbx\", nonce=\"n\", algorithm=SHA-256"
+    )
+    .is_none());
+    assert!(
+        sip_stack::digest::parse_challenge("Digest realm=\"pbx\", nonce=\"n\", algorithm=MD5")
+            .is_some()
+    );
+}

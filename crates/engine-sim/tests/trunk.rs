@@ -51,8 +51,9 @@ fn switch() -> Switch {
             },
         ],
         trunks: vec![TrunkConfig {
+            registration: call::TrunkRegistration::None,
             name: "mikopbx".to_string(),
-            peer: peer_addr(),
+            peer: Some(peer_addr()),
             outbound: Some(TrunkAuth {
                 username: TRUNK_OUT_USER.to_string(),
                 secret: TRUNK_OUT_SECRET.to_string(),
@@ -496,8 +497,9 @@ fn trunk_peer_challenge_is_answered_with_credentials() {
     let mut world = World::with_seed(0x5EED);
     let mut switch = Switch::new(SwitchConfig {
         trunks: vec![TrunkConfig {
+            registration: call::TrunkRegistration::None,
             name: "mikopbx".to_string(),
-            peer: peer_addr(),
+            peer: Some(peer_addr()),
             outbound: Some(TrunkAuth {
                 username: TRUNK_OUT_USER.to_string(),
                 secret: TRUNK_OUT_SECRET.to_string(),
@@ -557,8 +559,9 @@ fn trunk_auth_failure_maps_to_503() {
     let mut world = World::with_seed(0x5EED);
     let mut switch = Switch::new(SwitchConfig {
         trunks: vec![TrunkConfig {
+            registration: call::TrunkRegistration::None,
             name: "mikopbx".to_string(),
-            peer: peer_addr(),
+            peer: Some(peer_addr()),
             outbound: Some(TrunkAuth {
                 username: TRUNK_OUT_USER.to_string(),
                 secret: "wrongpass".to_string(),
@@ -661,8 +664,9 @@ fn trunk_peer_port_is_honored() {
     let mut world = World::with_seed(0x5EED);
     let mut switch = Switch::new(SwitchConfig {
         trunks: vec![TrunkConfig {
+            registration: call::TrunkRegistration::None,
             name: "mikopbx".to_string(),
-            peer: "192.168.77.108:5061".parse().expect("peer"),
+            peer: Some("192.168.77.108:5061".parse().expect("peer")),
             outbound: None,
             inbound: None,
         }],
@@ -845,8 +849,9 @@ fn trunk_proxy_auth_407_is_retried() {
     let mut world = World::with_seed(0x5EED);
     let mut switch = Switch::new(SwitchConfig {
         trunks: vec![TrunkConfig {
+            registration: call::TrunkRegistration::None,
             name: "mikopbx".to_string(),
-            peer: peer_addr(),
+            peer: Some(peer_addr()),
             outbound: Some(TrunkAuth {
                 username: TRUNK_OUT_USER.to_string(),
                 secret: TRUNK_OUT_SECRET.to_string(),
@@ -887,8 +892,9 @@ fn trunk_auth_retry_cseq_flows_to_bye() {
     let mut world = World::with_seed(0x5EED);
     let mut switch = Switch::new(SwitchConfig {
         trunks: vec![TrunkConfig {
+            registration: call::TrunkRegistration::None,
             name: "mikopbx".to_string(),
-            peer: peer_addr(),
+            peer: Some(peer_addr()),
             outbound: Some(TrunkAuth {
                 username: TRUNK_OUT_USER.to_string(),
                 secret: TRUNK_OUT_SECRET.to_string(),
